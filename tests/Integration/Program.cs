@@ -37,6 +37,10 @@ async Task HierarchyAsync()
 
     var run = await SubmitAsync(tree);
     await ExpectStatusAsync(run, "Invalid");
+    var progress = await ReadStatusAsync(run);
+    Equal(13L, progress.GetProperty("Progress").GetProperty("ProcessedTasks").GetInt64(), "processed includes invalid results once");
+    Equal(1L, progress.GetProperty("Progress").GetProperty("InvalidTasks").GetInt64(), "invalid count is separate from errors");
+    Equal(0L, progress.GetProperty("Progress").GetProperty("FailedTasks").GetInt64(), "a successful retry is not a failed record");
     Equal(2, await QueryAsync<int>("SELECT COUNT(DISTINCT WorkerId) FROM batch.TaskStatus WHERE RunId=@Run AND ProcessKey='parent'", run),
         "both worker processes executed the same process");
     Equal(1, await QueryAsync<int>("SELECT Attempts FROM batch.TaskStatus WHERE RunId=@Run AND ProcessKey='parent' AND RecordKey='0' AND Status='Invalid'", run),
@@ -65,12 +69,39 @@ async Task FailuresAsync()
         Group("serial", "serial",
             Step("fail", 1, mode: "permanent", children: [Step("child-skipped", 1)]),
             Step("sibling-skipped", 1)),
-        Step("healthy", 1),
+        Step("healthy", 3, mode: "hold"),
         Step("hard-timeout", 1, mode: "timeout", timeout: 1),
         Step("fetch-error", 5, mode: "cursor-cycle"));
 
     var run = await SubmitAsync(tree);
+    await WaitAsync(async () => await QueryAsync<int>("""
+        SELECT COUNT(*) FROM batch.RunProgress
+        WHERE RunId=@Run AND Status='Running' AND ProcessedTasks=1 AND FailedTasks=1
+            AND SkippedTasks=2 AND RunningTasks=1 AND PendingTasks=2
+        """, run) == 1);
+
+    var status = await ReadStatusAsync(run);
+    Equal("Running", status.GetProperty("Status").GetString(), "live CLI status");
+    var progress = status.GetProperty("Progress");
+    Equal(7L, progress.GetProperty("TotalTasks").GetInt64(), "live total includes staged records");
+    Equal(1L, progress.GetProperty("ProcessedTasks").GetInt64(), "live processed count");
+    Equal(2L, progress.GetProperty("PendingTasks").GetInt64(), "live pending count");
+    Equal(1L, progress.GetProperty("RunningTasks").GetInt64(), "live running count");
+    Equal(1L, progress.GetProperty("FailedTasks").GetInt64(), "live error count");
+    Equal(2L, progress.GetProperty("SkippedTasks").GetInt64(), "live skipped count");
+    var active = status.GetProperty("Nodes").EnumerateArray()
+        .Single(node => node.GetProperty("NodeKey").GetString() == "healthy");
+    Equal(2L, active.GetProperty("PendingTasks").GetInt64(), "live process pending count");
+    Equal(0, status.GetProperty("Tasks").GetArrayLength(), "progress can omit individual task rows");
+
+    await QueryAsync<int>("""
+        INSERT batch.SharedData (RunId, [Key], ValueJson, Version)
+        VALUES (@Run, N'integration.release', N'true', 1);
+        SELECT 1;
+        """, run);
     await ExpectStatusAsync(run, "Failed");
+    Equal(0L, await QueryAsync<long>("SELECT PendingTasks FROM batch.RunProgress WHERE RunId=@Run", run),
+        "terminal run has no pending records");
     Equal(2, await QueryAsync<int>("SELECT COUNT(*) FROM batch.Node WHERE RunId=@Run AND Status='Skipped'", run),
         "dependent processes were skipped");
     Equal(2, await QueryAsync<int>("SELECT COUNT(*) FROM batch.TaskStatus WHERE RunId=@Run AND Status='Skipped' AND ProcessKey='fetch-error' AND Attempts=0", run),
@@ -86,7 +117,7 @@ async Task FailuresAsync()
     await ExpectStatusAsync(malformed, "Failed");
     Equal(0, await QueryAsync<int>("SELECT COUNT(*) FROM batch.Node WHERE RunId=@Run", malformed),
         "malformed submission failed before scheduling");
-    Console.WriteLine("Passed permanent failure, branch skipping, cursor-cycle detection, timeout and validation.");
+    Console.WriteLine("Passed live progress, permanent failure, branch skipping, cursor-cycle detection, timeout and validation.");
 }
 
 async Task CrashRecoveryAsync()
@@ -214,6 +245,20 @@ async Task RunCliAsync(string command)
     using var process = Process.Start(StartInfo(command))!;
     await process.WaitForExitAsync();
     Equal(0, process.ExitCode, command);
+}
+
+async Task<JsonElement> ReadStatusAsync(Guid run)
+{
+    var start = StartInfo("status");
+    start.ArgumentList.Add(run.ToString());
+    start.ArgumentList.Add("0");
+    start.RedirectStandardOutput = true;
+    using var process = Process.Start(start)!;
+    var output = await process.StandardOutput.ReadToEndAsync();
+    await process.WaitForExitAsync();
+    Equal(0, process.ExitCode, "status");
+    using var json = JsonDocument.Parse(output);
+    return json.RootElement.Clone();
 }
 
 async Task StopWorkersAsync()

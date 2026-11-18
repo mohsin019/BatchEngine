@@ -58,6 +58,12 @@ public sealed class Fixture : IBatchProcess
             Thread.Sleep(Timeout.Infinite);
         }
 
+        if (mode == "hold")
+        {
+            while (await context.Shared.GetAsync("integration.release", ct) is null)
+                await Task.Delay(150, ct);
+        }
+
         await Task.Delay(300, ct);
         if (mode == "mixed" && record.GetInt32() == 0)
             return TaskResult.Invalid("Sample rejection");

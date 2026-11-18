@@ -50,12 +50,38 @@ EXEC batch.Submit
 
 -- To enqueue directly, supply DefinitionJson and optionally InputJson and SubmissionKey.
 -- INSERT batch.Submission(DefinitionJson, InputJson) OUTPUT inserted.Id VALUES (@Definition, @Input);
+~~~
 
-SELECT Id, Status, Error, StartedAt, FinishedAt FROM batch.Submission WHERE Id = @RunId;
-SELECT NodeKey, Status, OwnStatus, TotalTasks, RunningTasks, SucceededTasks, InvalidTasks, FailedTasks
-FROM batch.Node WHERE RunId = @RunId;
-SELECT TOP (100) Id, ProcessKey, RecordKey, Status, Attempts, WorkerId, Error
-FROM batch.TaskStatus WHERE RunId = @RunId AND Id > @AfterId ORDER BY Id;
+## Monitor a running workflow
+
+Run the updated executable with init-db on an existing batch database to install the progress views. The views also cover earlier submissions. While a workflow runs, use status with a task limit of zero to see its run totals and each process's counts.
+
+~~~sh
+dotnet src/BatchEngine/bin/Debug/net10.0/BatchEngine.dll status <run-id> 0
+~~~
+
+The counts come from SQL Server and reflect committed worker batches.
+
+| Count | Includes |
+| --- | --- |
+| TotalTasks | Records discovered so far. More records can appear as processes fetch pages. |
+| ProcessedTasks | Records with a Success or business Invalid outcome. |
+| PendingTasks | Records waiting to run, including staged records and tasks waiting to retry. |
+| RunningTasks | Records reserved by a worker. Expired leases count here until recovery requeues or fails them. |
+| FailedTasks | Records with a permanent error or exhausted retries. |
+| SkippedTasks | Discovered records that were never dispatched because preparation ended early. |
+
+SucceededTasks and InvalidTasks break down ProcessedTasks. A process can also fail in a lifecycle hook or during fetching. Its Status and Error show that failure separately from FailedTasks.
+
+A front end can query the views by run ID. Progress queries read per-process counters. For error details, page through the task status view.
+
+~~~sql
+SELECT * FROM batch.RunProgress WHERE RunId = @RunId;
+SELECT * FROM batch.ProcessProgress WHERE RunId = @RunId ORDER BY ProcessKey;
+SELECT TOP (100) Id, ProcessKey, RecordKey, Status, Attempts, Error
+FROM batch.TaskStatus
+WHERE RunId = @RunId AND Status = 'Failed' AND Id > @AfterId
+ORDER BY Id;
 ~~~
 
 ## Add business logic
@@ -90,7 +116,7 @@ The engine batches claims, renewals, and settlements, uses filtered queue indexe
 
 ## Verification
 
-The integration executable starts two independent workers, loads a separate business plugin assembly, and inserts submissions directly into SQL Server. It checks tree order, cross-worker task execution, staged fetches, both business outcomes, retries, task hooks, permanent failures, hard timeouts and recovery after a worker crash.
+The integration executable starts two independent workers, loads a separate business plugin assembly, and inserts submissions directly into SQL Server. It checks live progress counts, tree order, cross-worker task execution, staged fetches, both business outcomes, retries, task hooks, permanent failures, hard timeouts and recovery after a worker crash.
 
 ~~~sh
 export BATCH_TEST_SQL_CONNECTION='<disposable-sql-server-database-connection-string>'

@@ -151,19 +151,30 @@ internal sealed class Store
             DECLARE @Overview nvarchar(max) = (
                 SELECT s.Id, s.SubmissionKey, s.Status, s.Error, s.SubmittedAt, s.StartedAt, s.FinishedAt,
                     JSON_QUERY((
+                        SELECT r.TotalTasks, r.ProcessedTasks, r.PendingTasks, r.RunningTasks,
+                            r.SucceededTasks, r.InvalidTasks, r.FailedTasks, r.SkippedTasks
+                        FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
+                    )) AS Progress,
+                    JSON_QUERY((
                         SELECT n.NodeKey, p.NodeKey AS ParentKey, n.Position, n.Kind, n.Status, n.OwnStatus,
                             n.Phase, n.TotalTasks, n.RunningTasks, n.SucceededTasks, n.InvalidTasks, n.FailedTasks,
-                            CASE WHEN n.TasksReleased = 0 AND n.OwnStatus IS NOT NULL THEN n.TotalTasks ELSE 0 END AS SkippedTasks,
+                            COALESCE(progress.SkippedTasks, 0) AS SkippedTasks,
+                            COALESCE(progress.ProcessedTasks, 0) AS ProcessedTasks,
+                            COALESCE(progress.PendingTasks, 0) AS PendingTasks,
                             n.StartedAt, n.FinishedAt, n.Error
-                        FROM batch.Node n LEFT JOIN batch.Node p ON n.ParentId = p.Id WHERE n.RunId = s.Id
+                        FROM batch.Node n
+                        LEFT JOIN batch.Node p ON n.ParentId = p.Id
+                        LEFT JOIN batch.ProcessProgress progress ON progress.NodeId = n.Id
+                        WHERE n.RunId = s.Id
                         ORDER BY n.NodeKey FOR JSON PATH
                     )) AS Nodes,
-                    JSON_QUERY((
+                    JSON_QUERY(COALESCE((
                         SELECT TOP (@TaskLimit) ProcessKey, Id, RecordKey, Status, Attempts, WorkerId,
                             OutputJson, Error, StartedAt, FinishedAt
                         FROM batch.TaskStatus WHERE RunId = s.Id ORDER BY Id FOR JSON PATH
-                    )) AS Tasks
-                FROM batch.Submission s WHERE s.Id = @Id FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
+                    ), N'[]')) AS Tasks
+                FROM batch.Submission s JOIN batch.RunProgress r ON r.RunId = s.Id
+                WHERE s.Id = @Id FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
             );
             SELECT @Overview;
             """, connection) { CommandTimeout = 5 };
