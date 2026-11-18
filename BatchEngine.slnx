@@ -1,6 +1,7 @@
 <Solution>
   <Project Path="src/BatchEngine.Contracts/BatchEngine.Contracts.csproj" />
   <Project Path="src/BatchEngine/BatchEngine.csproj" />
+  <Project Path="src/BatchEngine.Api/BatchEngine.Api.csproj" />
   <Project Path="tests/FixturePlugin/FixturePlugin.csproj" />
   <Project Path="tests/Integration/Integration.csproj" />
 </Solution>

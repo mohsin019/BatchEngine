@@ -137,7 +137,7 @@ internal sealed class Worker(Store store, PluginRegistry plugins, WorkerOptions 
                         {
                             var keys = queued.SelectMany(Workflow.ConfigurationKeys).Distinct(StringComparer.Ordinal).ToArray();
                             var configurations = await store.ReadConfigurationsAsync(keys);
-                            await store.IngestAsync(queued.Select(item => Workflow.Prepare(item, plugins, configurations)).ToArray());
+                            await store.IngestAsync(queued.Select(item => Workflow.Prepare(item, plugins.Contains, configurations)).ToArray());
                         }
 
                         if (leases.Length > 0 || queued.Length > 0)

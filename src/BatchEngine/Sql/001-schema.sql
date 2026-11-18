@@ -144,30 +144,6 @@ FROM batch.Node n JOIN batch.Job j ON j.NodeId = n.Id
 WHERE j.Kind = 'Task';
 GO
 
-CREATE OR ALTER PROCEDURE batch.Submit
-    @DefinitionJson nvarchar(max), @InputJson nvarchar(max) = N'{}', @SubmissionKey nvarchar(200) = NULL
-AS
-BEGIN
-    SET NOCOUNT ON;
-    SET XACT_ABORT ON;
-    BEGIN TRANSACTION;
-    DECLARE @Id uniqueidentifier;
-    IF @SubmissionKey IS NOT NULL
-        SELECT @Id = Id FROM batch.Submission WITH (UPDLOCK, HOLDLOCK)
-        WHERE SubmissionKey = @SubmissionKey AND SubmissionKey IS NOT NULL;
-    IF @Id IS NULL
-    BEGIN
-        DECLARE @Inserted table(Id uniqueidentifier);
-        INSERT batch.Submission (SubmissionKey, DefinitionJson, InputJson)
-        OUTPUT inserted.Id INTO @Inserted
-        VALUES (@SubmissionKey, @DefinitionJson, @InputJson);
-        SELECT @Id = Id FROM @Inserted;
-    END;
-    COMMIT TRANSACTION;
-    SELECT @Id;
-END;
-GO
-
 CREATE OR ALTER FUNCTION batch.MergeStatus(@A varchar(8), @B varchar(8))
 RETURNS varchar(8)
 AS

@@ -1,5 +1,9 @@
 using System.Data;
 using System.Diagnostics;
+using System.Net;
+using System.Net.Http.Headers;
+using System.Net.Http.Json;
+using System.Net.Sockets;
 using System.Text.Json;
 using FixturePlugin;
 using Microsoft.Data.SqlClient;
@@ -14,8 +18,7 @@ await RunCliAsync("init-db");
 var workers = new List<Process>();
 try
 {
-    workers.Add(Worker("integration-a"));
-    workers.Add(Worker("integration-b"));
+    await GroupApiAsync();
     await ConfiguredVolumesAsync();
     await HierarchyAsync();
     await FailuresAsync();
@@ -193,18 +196,149 @@ async Task ConfiguredVolumesAsync()
     }
 }
 
-async Task<long> SaveConfigurationAsync(string key, long expectedRevision, int parallelTasks, string options)
+async Task<long> SaveConfigurationAsync(string key, long expectedRevision, int parallelTasks, string options,
+    string handler = "integration.volumes.v1", string childrenMode = "serial")
 {
     await using var connection = new SqlConnection(dsn);
     await connection.OpenAsync();
     await using var command = new SqlCommand("batch.SaveProcessConfiguration", connection)
         { CommandType = CommandType.StoredProcedure };
     command.Parameters.Add("@ConfigurationKey", SqlDbType.NVarChar, 64).Value = key;
-    command.Parameters.Add("@Handler", SqlDbType.NVarChar, 128).Value = "integration.volumes.v1";
+    command.Parameters.Add("@Handler", SqlDbType.NVarChar, 128).Value = handler;
+    command.Parameters.Add("@ChildrenMode", SqlDbType.VarChar, 8).Value = childrenMode;
     command.Parameters.Add("@ExpectedRevision", SqlDbType.BigInt).Value = expectedRevision;
     command.Parameters.Add("@MaxParallelTasks", SqlDbType.Int).Value = parallelTasks;
     command.Parameters.Add("@OptionsJson", SqlDbType.NVarChar, -1).Value = options;
     return (long)(await command.ExecuteScalarAsync())!;
+}
+
+async Task GroupApiAsync()
+{
+    var group = $"group-{Guid.NewGuid():N}";
+    var heldConfig = group + "-held";
+    var nextConfig = group + "-next";
+    await SaveConfigurationAsync(heldConfig, 0, 2,
+        JsonSerializer.Serialize(new { count = 2, mode = "hold" }), "integration.fixture.v1");
+    await SaveConfigurationAsync(nextConfig, 0, 1,
+        JsonSerializer.Serialize(new { count = 1, mode = "normal" }), "integration.fixture.v1", "parallel");
+
+    using var listener = new TcpListener(IPAddress.Loopback, 0);
+    listener.Start();
+    var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+    listener.Stop();
+    var uri = $"http://127.0.0.1:{port}";
+    var apiKey = Guid.NewGuid().ToString("N");
+    var apiAssembly = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory,
+        "../../../../../src/BatchEngine.Api/bin/Debug/net10.0/BatchEngine.Api.dll"));
+    var start = new ProcessStartInfo(dotnet) { UseShellExecute = false };
+    start.ArgumentList.Add(apiAssembly);
+    start.Environment["ASPNETCORE_URLS"] = uri;
+    start.Environment["BATCH_SQL_CONNECTION"] = dsn;
+    start.Environment["BATCH_API_KEY"] = apiKey;
+    start.Environment["Logging__LogLevel__Default"] = "Warning";
+
+    using var api = Process.Start(start)!;
+    using var client = new HttpClient { BaseAddress = new Uri(uri), Timeout = TimeSpan.FromSeconds(5) };
+    try
+    {
+        await WaitAsync(async () =>
+        {
+            if (api.HasExited)
+                throw new InvalidOperationException("The group API exited during startup.");
+            try
+            {
+                using var response = await client.GetAsync("/api/groups");
+                Equal(HttpStatusCode.Unauthorized, response.StatusCode, "API requires its service key");
+                return true;
+            }
+            catch (HttpRequestException) { return false; }
+        });
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+
+        var nestedMember = new { key = "nested", type = "group", children = new[] { Configured("first", heldConfig) } };
+        var second = Configured("second", nextConfig, Configured("third", nextConfig), Configured("fourth", nextConfig));
+
+        var list = await client.GetFromJsonAsync<JsonElement>($"/api/process-configurations?afterKey={group}");
+        Equal(true, list.EnumerateArray().Any(x => x.GetProperty("key").GetString() == heldConfig),
+            "the frontend can find process configurations");
+
+        using var invalid = await SaveAsync(0, Configured("a", "missing-configuration"));
+        Equal(HttpStatusCode.BadRequest, invalid.StatusCode, "a saved group rejects unknown configurations");
+
+        using var created = await SaveAsync(0, second, nestedMember);
+        Equal(HttpStatusCode.Created, created.StatusCode, "the frontend can save a group");
+
+        var groups = await client.GetFromJsonAsync<JsonElement>($"/api/groups?afterKey={group[..^1]}");
+        Equal(true, groups.EnumerateArray().Any(x => x.GetProperty("key").GetString() == group),
+            "the frontend can list saved groups");
+
+        using var reordered = await SaveAsync(1, nestedMember, second);
+        Equal(HttpStatusCode.OK, reordered.StatusCode, "the frontend can reorder the hierarchy");
+        var saved = await client.GetFromJsonAsync<JsonElement>($"/api/groups/{group}");
+        Equal(2L, saved.GetProperty("revision").GetInt64(), "group revision");
+        Equal("nested", saved.GetProperty("children")[0].GetProperty("key").GetString(), "group detail includes the new order");
+
+        using var staleEdit = await SaveAsync(1, second);
+        Equal(HttpStatusCode.Conflict, staleEdit.StatusCode, "stale group edit");
+
+        var submission = new { revision = 2, submissionKey = group, input = new { } };
+        using var submitted = await client.PostAsJsonAsync($"/api/groups/{group}/runs", submission);
+        Equal(HttpStatusCode.Accepted, submitted.StatusCode, "group is submitted through HTTP");
+        var run = (await submitted.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("runId").GetGuid();
+        Equal($"/api/runs/{run}", submitted.Headers.Location?.OriginalString, "submission returns a status URL");
+
+        var queued = await client.GetFromJsonAsync<JsonElement>($"/api/runs/{run}");
+        Equal("Queued", queued.GetProperty("Status").GetString(), "submission is durable before the workers start");
+        Equal(0, queued.GetProperty("Nodes").GetArrayLength(), "the queued run has no execution nodes yet");
+
+        using var replaced = await SaveAsync(2, second);
+        Equal(HttpStatusCode.OK, replaced.StatusCode, "an edit can remove a subgroup");
+        using var replay = await client.PostAsJsonAsync($"/api/groups/{group}/runs", submission);
+        Equal(HttpStatusCode.Accepted, replay.StatusCode, "replay of the previously submitted revision");
+        Equal(run, (await replay.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("runId").GetGuid(),
+            "the same submission key returns the original run");
+        using var staleRun = await client.PostAsJsonAsync($"/api/groups/{group}/runs",
+            new { revision = 2, submissionKey = group + "-other" });
+        Equal(HttpStatusCode.Conflict, staleRun.StatusCode, "new submissions require the current group revision");
+
+        workers.Add(Worker("integration-a"));
+        workers.Add(Worker("integration-b"));
+        await WaitAsync(async () => await QueryAsync<int>("""
+            SELECT COUNT(*) FROM batch.ProcessProgress WHERE RunId=@Run AND ProcessKey='first' AND RunningTasks=2
+            """, run) == 1);
+        var status = await client.GetFromJsonAsync<JsonElement>($"/api/runs/{run}");
+        Equal(group, status.GetProperty("GroupKey").GetString(), "run references the submitted group");
+        Equal(2L, status.GetProperty("GroupRevision").GetInt64(), "run keeps the submitted revision");
+        Equal("Pending", status.GetProperty("Nodes").EnumerateArray()
+            .Single(x => x.GetProperty("NodeKey").GetString() == "second").GetProperty("Status").GetString(),
+            "next process waits while tasks in the first process run in parallel");
+
+        await QueryAsync<int>("""
+            INSERT batch.SharedData (RunId, [Key], ValueJson, Version) VALUES (@Run, N'integration.release', N'true', 1);
+            SELECT 1;
+            """, run);
+        await ExpectStatusAsync(run, "Success");
+        Equal(3, await QueryAsync<int>("""
+            SELECT COUNT(*) FROM batch.Node a JOIN batch.Node b ON a.RunId=b.RunId
+            WHERE a.RunId=@Run AND a.FinishedAt <= b.StartedAt
+                AND ((a.NodeKey='first' AND b.NodeKey='second')
+                  OR (a.NodeKey='third' AND b.NodeKey='fourth')
+                  OR (a.NodeKey='nested' AND b.NodeKey='second'))
+            """, run), "the saved hierarchy and process children execute in order");
+        Console.WriteLine("Passed group API editing, revision snapshots, durable submission and sequential processes.");
+    }
+    finally
+    {
+        if (!api.HasExited)
+            api.Kill(entireProcessTree: true);
+        await api.WaitForExitAsync();
+    }
+
+    Task<HttpResponseMessage> SaveAsync(long expectedRevision, params object[] children) =>
+        client.PutAsJsonAsync($"/api/groups/{group}", new { displayName = "Integration group", expectedRevision, children });
+
+    static object Configured(string key, string configuration, params object[] children) =>
+        new { key, type = "process", configuration, children };
 }
 
 async Task CrashRecoveryAsync()

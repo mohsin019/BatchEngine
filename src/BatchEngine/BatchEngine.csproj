@@ -7,5 +7,6 @@
     <ProjectReference Include="../BatchEngine.Contracts/BatchEngine.Contracts.csproj" />
     <PackageReference Include="Microsoft.Data.SqlClient" Version="7.0.4" />
     <EmbeddedResource Include="Sql/*.sql" />
+    <InternalsVisibleTo Include="BatchEngine.Api" />
   </ItemGroup>
 </Project>

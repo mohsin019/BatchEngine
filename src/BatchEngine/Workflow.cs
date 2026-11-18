@@ -7,7 +7,7 @@ namespace BatchEngine;
 internal sealed record PlanNode(
     Guid Id, Guid? ParentId, int Position, string NodeKey, string Kind, string ChildrenMode,
     string? Handler, string OptionsJson, int MaxParallelTasks, int MaxAttempts, int TimeoutSeconds, int ChildCount);
-internal sealed record QueuedSubmission(Guid Id, string? DefinitionJson, string? InputJson);
+internal sealed record QueuedSubmission(Guid Id, string? DefinitionJson, string? InputJson, bool SavedGroup = false);
 internal sealed record Intake(Guid Id, PlanNode[]? Nodes, string? Error);
 internal sealed record ProcessConfiguration(string Handler, string ChildrenMode, string OptionsJson,
     int MaxParallelTasks, int MaxAttempts, int TimeoutSeconds);
@@ -16,6 +16,8 @@ internal static partial class Workflow
 {
     [GeneratedRegex(@"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\z", RegexOptions.CultureInvariant)]
     private static partial Regex NodeKey();
+
+    internal static bool IsNodeKey(string key) => NodeKey().IsMatch(key);
 
     internal static IEnumerable<string> ConfigurationKeys(QueuedSubmission submission)
     {
@@ -32,7 +34,7 @@ internal static partial class Workflow
                 if (node.ValueKind != JsonValueKind.Object)
                     continue;
                 if (node.TryGetProperty("configuration", out var value) && value.ValueKind == JsonValueKind.String &&
-                    value.GetString() is { } key && NodeKey().IsMatch(key))
+                    value.GetString() is { } key && IsNodeKey(key))
                     keys.Add(key);
                 if (node.TryGetProperty("children", out var children) && children.ValueKind == JsonValueKind.Array &&
                     children.GetArrayLength() <= 1000)
@@ -48,7 +50,7 @@ internal static partial class Workflow
         }
     }
 
-    internal static Intake Prepare(QueuedSubmission submission, PluginRegistry plugins,
+    internal static Intake Prepare(QueuedSubmission submission, Func<string, bool> hasHandler,
         IReadOnlyDictionary<string, ProcessConfiguration> configurations)
     {
         try
@@ -75,7 +77,7 @@ internal static partial class Workflow
                     throw new InvalidDataException("Each definition node must be a JSON object");
 
                 var key = RequiredString(node, "key");
-                if (!NodeKey().IsMatch(key) || !keys.Add(key))
+                if (!IsNodeKey(key) || !keys.Add(key))
                     throw new InvalidDataException($"Invalid or repeated node key: {key}");
                 var kind = RequiredString(node, "type");
                 if (kind is not ("group" or "process") || (parent is null && kind != "group") ||
@@ -84,6 +86,10 @@ internal static partial class Workflow
 
                 var allowed = new HashSet<string>(["key", "type", "children", "children_mode"]);
                 var configured = kind == "process" && node.TryGetProperty("configuration", out _);
+                if (submission.SavedGroup && kind == "process" && !configured)
+                    throw new InvalidDataException($"{key}: a saved group process must reference a process configuration");
+                if (submission.SavedGroup)
+                    allowed.Remove("children_mode");
                 if (configured)
                 {
                     allowed.Remove("children_mode");
@@ -103,8 +109,9 @@ internal static partial class Workflow
                         throw new InvalidDataException($"{key}: unknown process configuration '{configurationKey}'");
                 }
 
-                var mode = configuration?.ChildrenMode ?? (node.TryGetProperty("children_mode", out _)
-                    ? RequiredString(node, "children_mode") : "serial");
+                var mode = submission.SavedGroup ? "serial" :
+                    configuration?.ChildrenMode ?? (node.TryGetProperty("children_mode", out _)
+                        ? RequiredString(node, "children_mode") : "serial");
                 if (mode is not ("serial" or "parallel"))
                     throw new InvalidDataException($"{key}: children_mode must be serial or parallel");
 
@@ -119,7 +126,7 @@ internal static partial class Workflow
                 }
 
                 var handler = configuration?.Handler ?? (kind == "process" ? RequiredString(node, "handler") : null);
-                if (handler is not null && !plugins.Contains(handler))
+                if (handler is not null && !hasHandler(handler))
                     throw new InvalidDataException($"{key}: handler '{handler}' is not registered");
                 var options = configuration is not null ? Protocol.Parse(configuration.OptionsJson) :
                     node.TryGetProperty("options", out var value) ? value : Protocol.Parse("{}");

@@ -87,6 +87,53 @@ Reference the configuration in a workflow after deploying the named handler to a
 
 Use key, type, configuration and optional children on a configured process node. The worker reads the referenced settings when it accepts a queued workflow and persists them in its execution plan. Edits apply to workflows accepted after the save. A parallel-task limit of one runs tasks serially, and a larger limit allows that many concurrent task leases across the worker cluster for the process instance.
 
+## Group management API
+
+The ASP.NET Core API gives a frontend backend access to saved groups and run progress. Start it separately from the workers after running init-db with the current build.
+
+~~~sh
+export BATCH_SQL_CONNECTION='<connection-string>'
+export BATCH_API_KEY='<service-secret>'
+dotnet run --project src/BatchEngine.Api -- --urls http://127.0.0.1:5080
+~~~
+
+Send Authorization with the Bearer scheme and the service key from your frontend backend. The API exposes these routes.
+
+| Method and route | Result |
+| --- | --- |
+| GET /api/groups | List saved group keys, display names and revisions. |
+| GET /api/groups/{key} | Read the complete ordered group hierarchy. |
+| GET /api/process-configurations | List saved configuration keys for the process picker. |
+| PUT /api/groups/{key} | Save a group and its full hierarchy. |
+| POST /api/groups/{key}/runs | Queue the selected saved group revision. Returns HTTP 202, a run ID and a status URL. |
+| GET /api/runs/{id} | Read run status, process states and progress. Set taskLimit from 0 to 100 to include individual tasks. |
+
+The two lists accept limit from 1 to 100 and afterKey for paging by key. A group save takes displayName, expectedRevision and children. Use revision 0 to create a group. To edit or reorder a hierarchy, send the new children array with the currently saved revision. A child group can contain groups and processes. A process references a saved configuration and may have process children.
+
+~~~json
+{
+  "displayName": "Daily order audit",
+  "expectedRevision": 0,
+  "children": [
+    {
+      "key": "validation",
+      "type": "group",
+      "children": [
+        {"key": "orders", "type": "process", "configuration": "orders-audit"}
+      ]
+    }
+  ]
+}
+~~~
+
+Submit the group by key with its revision, a submissionKey for safe retries, and optional input. For example, send the following to POST /api/groups/daily-order-audit/runs after saving that group at revision 1.
+
+~~~json
+{"revision":1,"submissionKey":"daily-order-audit-request-1","input":{"region":"north"}}
+~~~
+
+A stale group revision returns HTTP 409. Repeating a submission with the same key, group revision and input returns the original run ID. SQL Server stores the group definition snapshot on submission. Workers accept that snapshot from the queue and execute its processes one at a time in tree order. Each process still uses its own parallel task limit across workers. Independent runs can execute concurrently.
+
 ## Monitor a running workflow
 
 Run the updated executable with init-db on an existing batch database to install the progress views. The views also cover earlier submissions. While a workflow runs, use status with a task limit of zero to see its run totals and each process's counts.
@@ -166,7 +213,7 @@ The engine batches claims, renewals, and settlements, uses filtered queue indexe
 
 ## Verification
 
-The integration executable starts two independent workers, loads a separate business plugin assembly, and inserts submissions directly into SQL Server. It checks editable process configurations, parallel result-set volumes, live task and record counts, tree order, cross-worker task execution, staged fetches, both business outcomes, retries, task hooks, permanent failures, hard timeouts and recovery after a worker crash.
+The integration executable starts two independent workers, loads a separate business plugin assembly, and submits work both directly to SQL Server and through the group API. It checks hierarchy editing and snapshots, editable process configurations, parallel result-set volumes, live task and record counts, tree order, cross-worker task execution, staged fetches, both business outcomes, retries, task hooks, permanent failures, hard timeouts and recovery after a worker crash.
 
 ~~~sh
 export BATCH_TEST_SQL_CONNECTION='<disposable-sql-server-database-connection-string>'

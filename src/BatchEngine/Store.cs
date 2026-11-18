@@ -5,7 +5,7 @@ using Microsoft.Data.SqlClient;
 
 namespace BatchEngine;
 
-internal sealed class Store
+internal sealed partial class Store
 {
     private readonly string connectionString;
 
@@ -69,7 +69,8 @@ internal sealed class Store
             IF @Reap = 1 EXEC batch.Reap @Limit = 128;
             SELECT TOP (2) Id,
                 CASE WHEN DATALENGTH(DefinitionJson) <= 4194304 THEN DefinitionJson END,
-                CASE WHEN DATALENGTH(InputJson) <= 4194304 THEN InputJson END
+                CASE WHEN DATALENGTH(InputJson) <= 4194304 THEN InputJson END,
+                CONVERT(bit, CASE WHEN GroupKey IS NULL THEN 0 ELSE 1 END)
             FROM batch.Submission WITH (READPAST, READCOMMITTEDLOCK)
             WHERE Status = 'Queued' ORDER BY SubmittedAt, Id;
             EXEC batch.Claim @Limit, @WorkerId, @LeaseSeconds;
@@ -83,7 +84,7 @@ internal sealed class Store
         await using var data = await command.ExecuteReaderAsync(ct);
         while (await data.ReadAsync(ct))
             queued.Add(new(data.GetGuid(0), data.IsDBNull(1) ? null : data.GetString(1),
-                data.IsDBNull(2) ? null : data.GetString(2)));
+                data.IsDBNull(2) ? null : data.GetString(2), data.GetBoolean(3)));
 
         if (!await data.NextResultAsync(ct) || !await data.ReadAsync(ct))
             throw new InvalidDataException("SQL Server did not return a claim result");
@@ -172,7 +173,8 @@ internal sealed class Store
         await using var connection = await OpenAsync(ct);
         await using var command = new SqlCommand("""
             DECLARE @Overview nvarchar(max) = (
-                SELECT s.Id, s.SubmissionKey, s.Status, s.Error, s.SubmittedAt, s.StartedAt, s.FinishedAt,
+                SELECT s.Id, s.SubmissionKey, s.GroupKey, s.GroupRevision, s.Status, s.Error,
+                    s.SubmittedAt, s.StartedAt, s.FinishedAt,
                     JSON_QUERY((
                         SELECT r.TotalTasks, r.ProcessedTasks, r.PendingTasks, r.RunningTasks,
                             r.SucceededTasks, r.InvalidTasks, r.FailedTasks, r.SkippedTasks,
@@ -180,7 +182,7 @@ internal sealed class Store
                             r.SucceededRecords, r.InvalidRecords, r.FailedRecords, r.SkippedRecords
                         FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
                     )) AS Progress,
-                    JSON_QUERY((
+                    JSON_QUERY(COALESCE((
                         SELECT n.NodeKey, p.NodeKey AS ParentKey, n.Position, n.Kind, n.Status, n.OwnStatus,
                             n.Phase, n.TotalTasks, n.RunningTasks, n.SucceededTasks, n.InvalidTasks, n.FailedTasks,
                             COALESCE(progress.SkippedTasks, 0) AS SkippedTasks,
@@ -197,7 +199,7 @@ internal sealed class Store
                         LEFT JOIN batch.ProcessProgress progress ON progress.NodeId = n.Id
                         WHERE n.RunId = s.Id
                         ORDER BY n.NodeKey FOR JSON PATH
-                    )) AS Nodes,
+                    ), N'[]')) AS Nodes,
                     JSON_QUERY(COALESCE((
                         SELECT TOP (@TaskLimit) ProcessKey, Id, RecordKey, Status, [RowCount], Attempts, WorkerId,
                             OutputJson, Error, StartedAt, FinishedAt
