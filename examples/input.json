@@ -1,0 +1,13 @@
+{
+  "limit": 100,
+  "records": [
+    {"id": "A-001", "amount": 37},
+    {"id": "A-002", "amount": 104},
+    {"id": "A-003", "amount": 95},
+    {"id": "A-004", "amount": 220},
+    {"id": "A-005", "amount": 100},
+    {"id": "A-006", "amount": 18},
+    {"id": "A-007", "amount": 80},
+    {"id": "A-008", "amount": 44}
+  ]
+}

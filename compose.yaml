@@ -1,0 +1,63 @@
+name: batch-engine-demo
+
+x-engine: &engine
+  build: .
+  image: batch-engine-demo:local
+  environment:
+    BATCH_SQL_CONNECTION: "Server=sql,1433;Database=BatchEngine;User ID=sa;Password=${BATCH_DEMO_PASSWORD:-BatchEngine_Local9!};Encrypt=True;TrustServerCertificate=True"
+    BATCH_SLOTS: "${BATCH_SLOTS:-4}"
+
+services:
+  sql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: Developer
+      MSSQL_MEMORY_LIMIT_MB: "${BATCH_DEMO_SQL_MEMORY_MB:-4096}"
+      MSSQL_SA_PASSWORD: "${BATCH_DEMO_PASSWORD:-BatchEngine_Local9!}"
+      SQLCMDPASSWORD: "${BATCH_DEMO_PASSWORD:-BatchEngine_Local9!}"
+    ports:
+      - "127.0.0.1:${BATCH_DEMO_SQL_PORT:-14333}:1433"
+    volumes:
+      - sql-data:/var/opt/mssql
+    healthcheck:
+      test: ["CMD", "/opt/mssql-tools18/bin/sqlcmd", "-S", "localhost", "-U", "sa", "-C", "-b", "-Q", "SELECT 1"]
+      interval: 3s
+      timeout: 4s
+      retries: 40
+      start_period: 20s
+
+  provision:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    depends_on:
+      sql:
+        condition: service_healthy
+    environment:
+      SQLCMDPASSWORD: "${BATCH_DEMO_PASSWORD:-BatchEngine_Local9!}"
+    entrypoint: ["/opt/mssql-tools18/bin/sqlcmd"]
+    command:
+      - "-S"
+      - "sql"
+      - "-U"
+      - "sa"
+      - "-C"
+      - "-b"
+      - "-Q"
+      - "IF DB_ID(N'BatchEngine') IS NULL EXEC(N'CREATE DATABASE BatchEngine'); IF DATABASEPROPERTYEX(N'BatchEngine', 'IsReadCommittedSnapshotOn') = 0 ALTER DATABASE BatchEngine SET READ_COMMITTED_SNAPSHOT ON;"
+
+  migrate:
+    <<: *engine
+    command: ["init-db"]
+    depends_on:
+      provision:
+        condition: service_completed_successfully
+
+  worker:
+    <<: *engine
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    stop_grace_period: 25s
+
+volumes:
+  sql-data:

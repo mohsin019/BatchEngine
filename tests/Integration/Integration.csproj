@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../FixturePlugin/FixturePlugin.csproj" />
+    <ProjectReference Include="../../src/BatchEngine/BatchEngine.csproj" ReferenceOutputAssembly="false" />
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="7.0.4" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,46 @@
+{
+  "key": "retail-audit",
+  "type": "group",
+  "children_mode": "serial",
+  "children": [
+    {
+      "key": "configure",
+      "type": "process",
+      "handler": "demo.configure.v1"
+    },
+    {
+      "key": "reviews",
+      "type": "group",
+      "children_mode": "parallel",
+      "children": [
+        {
+          "key": "orders",
+          "type": "process",
+          "handler": "demo.validate.v1",
+          "max_parallel_tasks": 3,
+          "children": [
+            {
+              "key": "order-followup",
+              "type": "process",
+              "handler": "demo.validate.v1",
+              "max_parallel_tasks": 2
+            }
+          ]
+        },
+        {
+          "key": "returns",
+          "type": "group",
+          "children_mode": "serial",
+          "children": [
+            {
+              "key": "return-review",
+              "type": "process",
+              "handler": "demo.validate.v1",
+              "max_parallel_tasks": 1
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
