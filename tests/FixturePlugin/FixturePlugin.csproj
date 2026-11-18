@@ -1,5 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <ItemGroup>
     <ProjectReference Include="../../src/BatchEngine.Contracts/BatchEngine.Contracts.csproj" />
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="7.0.4" />
   </ItemGroup>
 </Project>

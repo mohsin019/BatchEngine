@@ -90,6 +90,29 @@ internal sealed class Store
         return ([.. queued], JsonSerializer.Deserialize<JobLease[]>(data.GetString(0), Protocol.Json)!);
     }
 
+    internal async Task<IReadOnlyDictionary<string, ProcessConfiguration>> ReadConfigurationsAsync(
+        string[] keys, CancellationToken ct = default)
+    {
+        var configurations = new Dictionary<string, ProcessConfiguration>(StringComparer.Ordinal);
+        if (keys.Length == 0)
+            return configurations;
+
+        await using var connection = await OpenAsync(ct);
+        await using var command = new SqlCommand("""
+            SELECT c.ConfigurationKey, c.Handler, c.ChildrenMode, c.OptionsJson,
+                c.MaxParallelTasks, c.MaxAttempts, c.TimeoutSeconds
+            FROM batch.ProcessConfiguration c
+            JOIN OPENJSON(@Keys) WITH (ConfigurationKey nvarchar(64) '$') k
+                ON c.ConfigurationKey = k.ConfigurationKey COLLATE Latin1_General_100_BIN2;
+            """, connection) { CommandTimeout = 5 };
+        AddText(command, "@Keys", JsonSerializer.Serialize(keys, Protocol.Json));
+        await using var data = await command.ExecuteReaderAsync(ct);
+        while (await data.ReadAsync(ct))
+            configurations.Add(data.GetString(0), new(data.GetString(1), data.GetString(2),
+                data.GetString(3), data.GetInt32(4), data.GetInt32(5), data.GetInt32(6)));
+        return configurations;
+    }
+
     internal async Task IngestAsync(Intake[] plans, CancellationToken ct = default)
     {
         await using var connection = await OpenAsync(ct);
@@ -152,7 +175,9 @@ internal sealed class Store
                 SELECT s.Id, s.SubmissionKey, s.Status, s.Error, s.SubmittedAt, s.StartedAt, s.FinishedAt,
                     JSON_QUERY((
                         SELECT r.TotalTasks, r.ProcessedTasks, r.PendingTasks, r.RunningTasks,
-                            r.SucceededTasks, r.InvalidTasks, r.FailedTasks, r.SkippedTasks
+                            r.SucceededTasks, r.InvalidTasks, r.FailedTasks, r.SkippedTasks,
+                            r.TotalRecords, r.ProcessedRecords, r.PendingRecords, r.RunningRecords,
+                            r.SucceededRecords, r.InvalidRecords, r.FailedRecords, r.SkippedRecords
                         FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
                     )) AS Progress,
                     JSON_QUERY((
@@ -161,6 +186,11 @@ internal sealed class Store
                             COALESCE(progress.SkippedTasks, 0) AS SkippedTasks,
                             COALESCE(progress.ProcessedTasks, 0) AS ProcessedTasks,
                             COALESCE(progress.PendingTasks, 0) AS PendingTasks,
+                            n.MaxParallelTasks, n.TotalRecords, n.RunningRecords, n.SucceededRecords,
+                            n.InvalidRecords, n.FailedRecords,
+                            COALESCE(progress.SkippedRecords, 0) AS SkippedRecords,
+                            COALESCE(progress.ProcessedRecords, 0) AS ProcessedRecords,
+                            COALESCE(progress.PendingRecords, 0) AS PendingRecords,
                             n.StartedAt, n.FinishedAt, n.Error
                         FROM batch.Node n
                         LEFT JOIN batch.Node p ON n.ParentId = p.Id
@@ -169,7 +199,7 @@ internal sealed class Store
                         ORDER BY n.NodeKey FOR JSON PATH
                     )) AS Nodes,
                     JSON_QUERY(COALESCE((
-                        SELECT TOP (@TaskLimit) ProcessKey, Id, RecordKey, Status, Attempts, WorkerId,
+                        SELECT TOP (@TaskLimit) ProcessKey, Id, RecordKey, Status, [RowCount], Attempts, WorkerId,
                             OutputJson, Error, StartedAt, FinishedAt
                         FROM batch.TaskStatus WHERE RunId = s.Id ORDER BY Id FOR JSON PATH
                     ), N'[]')) AS Tasks

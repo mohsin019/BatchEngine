@@ -9,13 +9,47 @@ internal sealed record PlanNode(
     string? Handler, string OptionsJson, int MaxParallelTasks, int MaxAttempts, int TimeoutSeconds, int ChildCount);
 internal sealed record QueuedSubmission(Guid Id, string? DefinitionJson, string? InputJson);
 internal sealed record Intake(Guid Id, PlanNode[]? Nodes, string? Error);
+internal sealed record ProcessConfiguration(string Handler, string ChildrenMode, string OptionsJson,
+    int MaxParallelTasks, int MaxAttempts, int TimeoutSeconds);
 
 internal static partial class Workflow
 {
     [GeneratedRegex(@"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\z", RegexOptions.CultureInvariant)]
     private static partial Regex NodeKey();
 
-    internal static Intake Prepare(QueuedSubmission submission, PluginRegistry plugins)
+    internal static IEnumerable<string> ConfigurationKeys(QueuedSubmission submission)
+    {
+        if (submission.DefinitionJson is null ||
+            Encoding.UTF8.GetByteCount(submission.DefinitionJson) > Protocol.SubmissionBytes)
+            return [];
+        try
+        {
+            var keys = new HashSet<string>(StringComparer.Ordinal);
+            var nodes = new Stack<JsonElement>();
+            nodes.Push(Protocol.Parse(submission.DefinitionJson));
+            for (var visited = 0; visited < 1000 && nodes.TryPop(out var node); visited++)
+            {
+                if (node.ValueKind != JsonValueKind.Object)
+                    continue;
+                if (node.TryGetProperty("configuration", out var value) && value.ValueKind == JsonValueKind.String &&
+                    value.GetString() is { } key && NodeKey().IsMatch(key))
+                    keys.Add(key);
+                if (node.TryGetProperty("children", out var children) && children.ValueKind == JsonValueKind.Array &&
+                    children.GetArrayLength() <= 1000)
+                    foreach (var child in children.EnumerateArray())
+                        nodes.Push(child);
+            }
+            return keys;
+        }
+        catch (Exception exception) when (exception is JsonException or InvalidOperationException)
+        {
+            // Prepare records the validation error on this submission.
+            return [];
+        }
+    }
+
+    internal static Intake Prepare(QueuedSubmission submission, PluginRegistry plugins,
+        IReadOnlyDictionary<string, ProcessConfiguration> configurations)
     {
         try
         {
@@ -49,14 +83,28 @@ internal static partial class Workflow
                     throw new InvalidDataException($"{key}: use a group root and only process children under a process");
 
                 var allowed = new HashSet<string>(["key", "type", "children", "children_mode"]);
-                if (kind == "process")
+                var configured = kind == "process" && node.TryGetProperty("configuration", out _);
+                if (configured)
+                {
+                    allowed.Remove("children_mode");
+                    allowed.Add("configuration");
+                }
+                else if (kind == "process")
                     allowed.UnionWith(["handler", "options", "max_parallel_tasks", "max_attempts", "timeout_seconds"]);
                 foreach (var property in node.EnumerateObject())
                     if (!allowed.Remove(property.Name))
                         throw new InvalidDataException($"{key}: unknown or repeated field {property.Name}");
 
-                var mode = node.TryGetProperty("children_mode", out _)
-                    ? RequiredString(node, "children_mode") : "serial";
+                ProcessConfiguration? configuration = null;
+                if (configured)
+                {
+                    var configurationKey = RequiredString(node, "configuration");
+                    if (!configurations.TryGetValue(configurationKey, out configuration))
+                        throw new InvalidDataException($"{key}: unknown process configuration '{configurationKey}'");
+                }
+
+                var mode = configuration?.ChildrenMode ?? (node.TryGetProperty("children_mode", out _)
+                    ? RequiredString(node, "children_mode") : "serial");
                 if (mode is not ("serial" or "parallel"))
                     throw new InvalidDataException($"{key}: children_mode must be serial or parallel");
 
@@ -70,22 +118,20 @@ internal static partial class Workflow
                     children = [.. childArray.EnumerateArray()];
                 }
 
-                var handler = kind == "process" ? RequiredString(node, "handler") : null;
+                var handler = configuration?.Handler ?? (kind == "process" ? RequiredString(node, "handler") : null);
                 if (handler is not null && !plugins.Contains(handler))
                     throw new InvalidDataException($"{key}: handler '{handler}' is not registered");
-                var options = "{}";
-                if (node.TryGetProperty("options", out var value))
-                {
-                    if (value.ValueKind != JsonValueKind.Object)
-                        throw new InvalidDataException($"{key}: options must be a JSON object");
-                    options = Protocol.Value(value, "Process options", 64 * 1024);
-                }
+                var options = configuration is not null ? Protocol.Parse(configuration.OptionsJson) :
+                    node.TryGetProperty("options", out var value) ? value : Protocol.Parse("{}");
+                if (options.ValueKind != JsonValueKind.Object)
+                    throw new InvalidDataException($"{key}: options must be a JSON object");
+                var optionsJson = Protocol.Value(options, "Process options", 64 * 1024);
 
                 var item = new PlanNode(Guid.NewGuid(), parent?.Id, position, key,
-                    kind == "group" ? "Group" : "Process", mode, handler, options,
-                    Integer(node, "max_parallel_tasks", 1, 256),
-                    Integer(node, "max_attempts", 3, 20),
-                    Integer(node, "timeout_seconds", 60, 86400), children.Length);
+                    kind == "group" ? "Group" : "Process", mode, handler, optionsJson,
+                    configuration?.MaxParallelTasks ?? Integer(node, "max_parallel_tasks", 1, 256),
+                    configuration?.MaxAttempts ?? Integer(node, "max_attempts", 3, 20),
+                    configuration?.TimeoutSeconds ?? Integer(node, "timeout_seconds", 60, 86400), children.Length);
                 nodes.Add(item);
 
                 for (var index = 0; index < children.Length; index++)

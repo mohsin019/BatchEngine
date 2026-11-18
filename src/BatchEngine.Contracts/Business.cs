@@ -10,7 +10,21 @@ public sealed class ProcessHandlerAttribute(string name) : Attribute
 
 public enum BusinessStatus { Success, Invalid, Failed }
 
-public sealed record Record(string Key, JsonElement Payload);
+public sealed record Record(string Key, JsonElement Payload)
+{
+    public int RowCount { get; private init; } = 1;
+
+    /// <summary>Creates one independently scheduled task whose payload is an array of result rows.</summary>
+    public static Record FromResultSet<T>(string key, IReadOnlyList<T> rows)
+    {
+        ArgumentNullException.ThrowIfNull(rows);
+        var payload = JsonSerializer.SerializeToElement(rows);
+        var count = payload.GetArrayLength();
+        if (count == 0)
+            throw new ArgumentException("A task volume must have at least one row.", nameof(rows));
+        return new Record(key, payload) { RowCount = count };
+    }
+}
 public sealed record RecordPage(IReadOnlyList<Record> Records, string? NextCursor = null);
 public sealed record TaskResult(BusinessStatus Status, JsonElement? Output = null, string? Reason = null)
 {

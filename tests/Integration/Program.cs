@@ -16,6 +16,7 @@ try
 {
     workers.Add(Worker("integration-a"));
     workers.Add(Worker("integration-b"));
+    await ConfiguredVolumesAsync();
     await HierarchyAsync();
     await FailuresAsync();
 
@@ -118,6 +119,92 @@ async Task FailuresAsync()
     Equal(0, await QueryAsync<int>("SELECT COUNT(*) FROM batch.Node WHERE RunId=@Run", malformed),
         "malformed submission failed before scheduling");
     Console.WriteLine("Passed live progress, permanent failure, branch skipping, cursor-cycle detection, timeout and validation.");
+}
+
+async Task ConfiguredVolumesAsync()
+{
+    var fixtureId = Guid.NewGuid();
+    await QueryAsync<int>("""
+        IF OBJECT_ID('dbo.BatchEngineIntegrationVolumeRow', 'U') IS NULL
+            CREATE TABLE dbo.BatchEngineIntegrationVolumeRow (
+                FixtureId uniqueidentifier NOT NULL, Id int NOT NULL, Amount int NOT NULL,
+                PRIMARY KEY (FixtureId, Id)
+            );
+        INSERT dbo.BatchEngineIntegrationVolumeRow VALUES (@Run, 1, 10), (@Run, 2, 20),
+            (@Run, 3, -5), (@Run, 4, 40), (@Run, 5, 99), (@Run, 6, 60);
+        SELECT 1;
+        """, fixtureId);
+
+    var configuration = $"volumes-{fixtureId:N}";
+    var settings = JsonSerializer.Serialize(new { fixtureId, rowsPerVolume = 2 });
+    Equal(1L, await SaveConfigurationAsync(configuration, 0, 2, settings), "initial process configuration");
+    var tree = Group("root", "serial", new { key = "volumes", type = "process", configuration });
+    var first = await SubmitAsync(tree);
+    await WaitAsync(async () => await QueryAsync<int>("""
+        SELECT COUNT(*) FROM batch.RunProgress
+        WHERE RunId=@Run AND RunningTasks=2 AND PendingTasks=1 AND RunningRecords=4 AND PendingRecords=2
+        """, first) == 1);
+    Equal(2, await QueryAsync<int>("""
+        SELECT COUNT(DISTINCT WorkerId) FROM batch.TaskStatus WHERE RunId=@Run AND Status='Running'
+        """, first), "different workers lease the result-set volumes");
+
+    Equal(2L, await SaveConfigurationAsync(configuration, 1, 1, settings), "edited process configuration");
+    try
+    {
+        await SaveConfigurationAsync(configuration, 1, 2, settings);
+        throw new InvalidOperationException("A stale edit overwrote the process configuration.");
+    }
+    catch (SqlException ex) when (ex.Number == 51013) { }
+    Equal(2, await QueryAsync<int>("SELECT MaxParallelTasks FROM batch.Node WHERE RunId=@Run AND NodeKey='volumes'", first),
+        "running process retained its accepted concurrency");
+    await ReleaseAndCheckAsync(first);
+
+    var next = await SubmitAsync(tree);
+    await WaitAsync(async () => await QueryAsync<int>("""
+        SELECT COUNT(*) FROM batch.RunProgress
+        WHERE RunId=@Run AND RunningTasks=1 AND PendingTasks=2 AND RunningRecords=2 AND PendingRecords=4
+        """, next) == 1);
+    Equal(1, await QueryAsync<int>("SELECT MaxParallelTasks FROM batch.Node WHERE RunId=@Run AND NodeKey='volumes'", next),
+        "new process picked up the revised concurrency");
+    await ReleaseAndCheckAsync(next);
+
+    Console.WriteLine("Passed editable process configuration, parallel SQL result sets and row progress.");
+
+    async Task ReleaseAndCheckAsync(Guid run)
+    {
+        await QueryAsync<int>("""
+            INSERT batch.SharedData (RunId, [Key], ValueJson, Version) VALUES (@Run, N'volumes.release', N'true', 1);
+            SELECT 1;
+            """, run);
+        await ExpectStatusAsync(run, "Failed");
+        var progress = (await ReadStatusAsync(run)).GetProperty("Progress");
+        Equal(3L, progress.GetProperty("TotalTasks").GetInt64(), "one task per result set");
+        Equal(6L, progress.GetProperty("TotalRecords").GetInt64(), "all result rows were counted");
+        Equal(4L, progress.GetProperty("ProcessedRecords").GetInt64(), "processed rows include invalid rows");
+        Equal(2L, progress.GetProperty("InvalidRecords").GetInt64(), "invalid volume carries its row count");
+        Equal(2L, progress.GetProperty("FailedRecords").GetInt64(), "failed volume carries its row count");
+        Equal(0L, progress.GetProperty("PendingRecords").GetInt64(), "a terminal run has no pending rows");
+        await QueryAsync<int>("""
+            IF EXISTS (SELECT 1 FROM batch.TaskStatus WHERE RunId=@Run AND RecordKey='1'
+                AND Status='Success' AND OutputJson=N'[1,2]' AND [RowCount]=2 AND Attempts=2)
+                SELECT 1;
+            ELSE THROW 51014, 'Expected the first result set to reach its task intact', 1;
+            """, run);
+    }
+}
+
+async Task<long> SaveConfigurationAsync(string key, long expectedRevision, int parallelTasks, string options)
+{
+    await using var connection = new SqlConnection(dsn);
+    await connection.OpenAsync();
+    await using var command = new SqlCommand("batch.SaveProcessConfiguration", connection)
+        { CommandType = CommandType.StoredProcedure };
+    command.Parameters.Add("@ConfigurationKey", SqlDbType.NVarChar, 64).Value = key;
+    command.Parameters.Add("@Handler", SqlDbType.NVarChar, 128).Value = "integration.volumes.v1";
+    command.Parameters.Add("@ExpectedRevision", SqlDbType.BigInt).Value = expectedRevision;
+    command.Parameters.Add("@MaxParallelTasks", SqlDbType.Int).Value = parallelTasks;
+    command.Parameters.Add("@OptionsJson", SqlDbType.NVarChar, -1).Value = options;
+    return (long)(await command.ExecuteScalarAsync())!;
 }
 
 async Task CrashRecoveryAsync()
@@ -223,6 +310,7 @@ ProcessStartInfo StartInfo(string command)
     start.ArgumentList.Add(engine);
     start.ArgumentList.Add(command);
     start.Environment["BATCH_SQL_CONNECTION"] = dsn;
+    start.Environment["BATCH_TEST_BUSINESS_CONNECTION"] = dsn;
     start.Environment["BATCH_PLUGIN_PATHS"] = typeof(Fixture).Assembly.Location;
     start.Environment["BATCH_SLOTS"] = "1";
     start.Environment["BATCH_PAGE_SIZE"] = "2";

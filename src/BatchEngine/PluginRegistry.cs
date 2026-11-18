@@ -49,6 +49,14 @@ internal sealed class PluginRegistry
         {
             if (name.Name == typeof(IBatchProcess).Assembly.GetName().Name)
                 return typeof(IBatchProcess).Assembly;
+            // Share the platform-specific SqlClient already selected by the host when it meets the plugin's version.
+            if (name.Name == "Microsoft.Data.SqlClient")
+            {
+                var sqlClient = typeof(Microsoft.Data.SqlClient.SqlConnection).Assembly;
+                if (name.Version is null || sqlClient.GetName().Version >= name.Version)
+                    return sqlClient;
+            }
+
             var path = resolver.ResolveAssemblyToPath(name);
             if (path is not null)
                 return LoadFromAssemblyPath(path);

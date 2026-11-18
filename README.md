@@ -32,7 +32,8 @@ A workflow is a JSON tree with a group at its root. Groups can contain groups an
 | Field | Behavior |
 | --- | --- |
 | children_mode | serial runs each child subtree to completion in array order. parallel makes all child subtrees eligible together. The default is serial. |
-| handler | Registered, versioned business handler name on a process. |
+| configuration | Key of a saved SQL Server process configuration. A referenced configuration supplies the settings for that process. |
+| handler | Registered, versioned business handler name on a process with inline settings. |
 | max_parallel_tasks | Simultaneous task leases for this process instance across all workers. The default is 1. |
 | max_attempts | Maximum attempts per task, lifecycle stage or fetch page. The default is 3. |
 | timeout_seconds | Deadline for each attempt, including hooks and shared-data calls. The default is 60. |
@@ -52,6 +53,40 @@ EXEC batch.Submit
 -- INSERT batch.Submission(DefinitionJson, InputJson) OUTPUT inserted.Id VALUES (@Definition, @Input);
 ~~~
 
+## Save process settings in SQL Server
+
+Run init-db with the updated executable to install batch.ProcessConfiguration and batch.SaveProcessConfiguration. A frontend backend can read the configuration table and call the procedure to save a whole configuration. The procedure checks the revision to detect concurrent edits.
+
+~~~sql
+EXEC batch.SaveProcessConfiguration
+    @ConfigurationKey = N'orders-audit',
+    @Handler = N'orders.audit.v1',
+    @ExpectedRevision = 0,
+    @MaxParallelTasks = 4,
+    @MaxAttempts = 3,
+    @TimeoutSeconds = 60,
+    @ChildrenMode = 'serial',
+    @OptionsJson = N'{"rowsPerVolume":100}';
+
+SELECT * FROM batch.ProcessConfiguration WHERE ConfigurationKey = N'orders-audit';
+~~~
+
+Pass revision zero on creation. For an update, pass the revision from the row you read and use the new revision returned by the procedure. The backend identity can read the table and execute the save procedure.
+
+Reference the configuration in a workflow after deploying the named handler to all workers.
+
+~~~json
+{
+  "key": "audit",
+  "type": "group",
+  "children": [
+    {"key": "orders", "type": "process", "configuration": "orders-audit"}
+  ]
+}
+~~~
+
+Use key, type, configuration and optional children on a configured process node. The worker reads the referenced settings when it accepts a queued workflow and persists them in its execution plan. Edits apply to workflows accepted after the save. A parallel-task limit of one runs tasks serially, and a larger limit allows that many concurrent task leases across the worker cluster for the process instance.
+
 ## Monitor a running workflow
 
 Run the updated executable with init-db on an existing batch database to install the progress views. The views also cover earlier submissions. While a workflow runs, use status with a task limit of zero to see its run totals and each process's counts.
@@ -60,16 +95,16 @@ Run the updated executable with init-db on an existing batch database to install
 dotnet src/BatchEngine/bin/Debug/net10.0/BatchEngine.dll status <run-id> 0
 ~~~
 
-The counts come from SQL Server and reflect committed worker batches.
+The counts come from SQL Server and reflect committed worker batches. Task counts measure task volumes. The matching record counts, such as ProcessedRecords, PendingRecords and FailedRecords, measure source rows. An ordinary task contributes one record. Every row in a result-set volume receives that task's outcome.
 
 | Count | Includes |
 | --- | --- |
-| TotalTasks | Records discovered so far. More records can appear as processes fetch pages. |
-| ProcessedTasks | Records with a Success or business Invalid outcome. |
-| PendingTasks | Records waiting to run, including staged records and tasks waiting to retry. |
-| RunningTasks | Records reserved by a worker. Expired leases count here until recovery requeues or fails them. |
-| FailedTasks | Records with a permanent error or exhausted retries. |
-| SkippedTasks | Discovered records that were never dispatched because preparation ended early. |
+| TotalTasks | Tasks discovered so far. More tasks can appear as processes fetch pages. |
+| ProcessedTasks | Tasks with a Success or business Invalid outcome. |
+| PendingTasks | Tasks waiting to run, including staged volumes and tasks waiting to retry. |
+| RunningTasks | Tasks reserved by a worker. Expired leases count here until recovery requeues or fails them. |
+| FailedTasks | Tasks with a permanent error or exhausted retries. |
+| SkippedTasks | Discovered tasks left undispatched because preparation ended early. |
 
 SucceededTasks and InvalidTasks break down ProcessedTasks. A process can also fail in a lifecycle hook or during fetching. Its Status and Error show that failure separately from FailedTasks.
 
@@ -78,7 +113,7 @@ A front end can query the views by run ID. Progress queries read per-process cou
 ~~~sql
 SELECT * FROM batch.RunProgress WHERE RunId = @RunId;
 SELECT * FROM batch.ProcessProgress WHERE RunId = @RunId ORDER BY ProcessKey;
-SELECT TOP (100) Id, ProcessKey, RecordKey, Status, Attempts, Error
+SELECT TOP (100) Id, ProcessKey, RecordKey, [RowCount], Status, Attempts, Error
 FROM batch.TaskStatus
 WHERE RunId = @RunId AND Status = 'Failed' AND Id > @AfterId
 ORDER BY Id;
@@ -86,15 +121,30 @@ ORDER BY Id;
 
 ## Add business logic
 
-Reference src/BatchEngine.Contracts from a .NET 10 class library. Create a public IBatchProcess implementation with a public parameterless constructor and a ProcessHandler attribute such as ProcessHandler("orders.validate.v1"). Deploy the library and its dependencies to each worker, and include the DLL in BATCH_PLUGIN_PATHS. Separate multiple paths with the platform path separator. Register a new handler name when changing logic for new submissions while older runs still need the previous implementation.
+Reference src/BatchEngine.Contracts from a .NET 10 class library. Create a public IBatchProcess implementation with a public parameterless constructor and a ProcessHandler attribute such as ProcessHandler("orders.validate.v1"). For plugins with NuGet dependencies, set EnableDynamicLoading to true in the plugin project and deploy its publish output, including the dependency manifest and runtime assets. Deploy the library to each worker and include its DLL in BATCH_PLUGIN_PATHS. Separate multiple paths with the platform path separator. Register a new handler name when changing logic for new submissions while older runs still need the previous implementation.
 
 | Method | When it runs |
 | --- | --- |
 | BeforeProcessAsync | Before the first fetch page. |
 | FetchRecordsAsync | Returns RecordPage values until NextCursor is null. The worker commits each page and its checkpoint together. Tasks are released after the final page. |
-| BeforeTaskAsync and RunTaskAsync | Run per record on any available worker. Return TaskResult.Success or TaskResult.Invalid with a reason. |
+| BeforeTaskAsync and RunTaskAsync | Run per task volume on any available worker. Return TaskResult.Success or TaskResult.Invalid with a reason. |
 | AfterTaskAsync | Receives the outcome of each attempt that returns or throws in the runner. An attempt killed by a crash or a hard timeout cannot call this hook. |
 | AfterProcessAsync | Receives the final outcome and counts for the process's own work, including a start or fetch failure. The engine can retry this hook independently. |
+
+### Query business tables and create task volumes
+
+Use FetchRecordsAsync to query business tables in bounded pages and project each row into a serializable model. Group rows into task volumes using stable keys. Return Record.FromResultSet for each volume in the RecordPage. The limit parameter caps the number of volumes in the page. A cursor should identify where the next business query resumes.
+
+~~~csharp
+var volumes = rows.Chunk(rowsPerVolume)
+    .Select(chunk => Record.FromResultSet(chunk[0].Id.ToString(), chunk))
+    .ToArray();
+return new RecordPage(volumes, nextCursor);
+~~~
+
+SQL Server saves each volume with its result rows. The worker that leases the task passes those rows as a JSON array to BeforeTaskAsync, RunTaskAsync and AfterTaskAsync. Deserialize the array with resultSet.Deserialize<OrderRow[]>() or iterate it with EnumerateArray(). A retry receives the same saved result set. The integration fixture DatabaseVolumes.cs contains a working SQL query, cursor, and RunTaskAsync implementation.
+
+Size each volume within the 256 KiB payload limit and each fetch page within 4 MiB. One task outcome applies to its entire volume. When rows need independent retry or outcome tracking, return a separate task per row.
 
 Use stable record keys and stable keyset pagination over the source records. The engine keeps one task per process and record key, preserving the first accepted payload. A repeated cursor fails the fetch. A business rejection can also be signaled by BusinessInvalidException in start, fetch, or task work. Exceptions retry with exponential backoff up to the attempt limit. An after-task hook failure retries the task attempt. PermanentProcessException fails immediately.
 
@@ -116,7 +166,7 @@ The engine batches claims, renewals, and settlements, uses filtered queue indexe
 
 ## Verification
 
-The integration executable starts two independent workers, loads a separate business plugin assembly, and inserts submissions directly into SQL Server. It checks live progress counts, tree order, cross-worker task execution, staged fetches, both business outcomes, retries, task hooks, permanent failures, hard timeouts and recovery after a worker crash.
+The integration executable starts two independent workers, loads a separate business plugin assembly, and inserts submissions directly into SQL Server. It checks editable process configurations, parallel result-set volumes, live task and record counts, tree order, cross-worker task execution, staged fetches, both business outcomes, retries, task hooks, permanent failures, hard timeouts and recovery after a worker crash.
 
 ~~~sh
 export BATCH_TEST_SQL_CONNECTION='<disposable-sql-server-database-connection-string>'

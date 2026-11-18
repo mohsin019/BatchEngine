@@ -7,7 +7,7 @@ BEGIN
     DECLARE @RunId uniqueidentifier, @Resource nvarchar(255), @LockResult int, @Payload nvarchar(max);
     DECLARE @Locked table(RunId uniqueidentifier PRIMARY KEY);
     DECLARE @Candidates table(Id bigint PRIMARY KEY);
-    DECLARE @Claimed table(Id bigint PRIMARY KEY, NodeId uniqueidentifier, Kind varchar(8));
+    DECLARE @Claimed table(Id bigint PRIMARY KEY, NodeId uniqueidentifier, Kind varchar(8), [RowCount] int);
 
     -- Look for ready work before taking any locks. Re-read after taking each run lock.
     DECLARE runs CURSOR LOCAL FAST_FORWARD FOR
@@ -57,12 +57,13 @@ BEGIN
         UPDATE j SET Status = 'Running', Attempts = Attempts + 1, WorkerId = @WorkerId,
             LeaseToken = NEWID(), LeaseUntil = DATEADD(second, @LeaseSeconds, SYSUTCDATETIME()),
             StartedAt = COALESCE(StartedAt, SYSUTCDATETIME())
-        OUTPUT inserted.Id, inserted.NodeId, inserted.Kind INTO @Claimed
+        OUTPUT inserted.Id, inserted.NodeId, inserted.Kind, inserted.[RowCount] INTO @Claimed
         FROM batch.Job j JOIN @Candidates c ON j.Id = c.Id;
 
-        UPDATE n SET RunningTasks = RunningTasks + c.Amount
+        UPDATE n SET RunningTasks = RunningTasks + c.Amount, RunningRecords = RunningRecords + c.Records
         FROM batch.Node n JOIN (
-            SELECT NodeId, COUNT(*) AS Amount FROM @Claimed WHERE Kind = 'Task' GROUP BY NodeId
+            SELECT NodeId, COUNT(*) AS Amount, SUM(CONVERT(bigint, [RowCount])) AS Records
+            FROM @Claimed WHERE Kind = 'Task' GROUP BY NodeId
         ) c ON n.Id = c.NodeId;
     END;
 
@@ -116,7 +117,7 @@ CREATE OR ALTER PROCEDURE batch.SettleStage
 AS
 BEGIN
     SET NOCOUNT ON;
-    DECLARE @NodeId uniqueidentifier, @Kind varchar(8), @Attempts int, @MaxAttempts int, @Inserted int;
+    DECLARE @NodeId uniqueidentifier, @Kind varchar(8), @Attempts int, @MaxAttempts int;
     SELECT @NodeId = j.NodeId, @Kind = j.Kind, @Attempts = j.Attempts, @MaxAttempts = n.MaxAttempts
     FROM batch.Job j WITH (UPDLOCK) JOIN batch.Node n ON n.Id = j.NodeId
     WHERE j.Id = @Id AND j.LeaseToken = @Token AND j.Status = 'Running'
@@ -146,21 +147,25 @@ BEGIN
 
     IF @Kind = 'Fetch' AND @Status = 'Success'
     BEGIN
+        DECLARE @Staged table ([RowCount] int NOT NULL);
         ;WITH PageRecords AS (
-            SELECT r.RecordKey, r.PayloadJson, ROW_NUMBER() OVER (
+            SELECT r.RecordKey, r.PayloadJson, COALESCE(r.[RowCount], 1) AS [RowCount], ROW_NUMBER() OVER (
                 PARTITION BY r.RecordKey COLLATE Latin1_General_100_BIN2 ORDER BY CONVERT(int, entries.[key])
             ) AS RowNumber
             FROM OPENJSON(@Records) entries
-            CROSS APPLY OPENJSON(entries.value) WITH (RecordKey nvarchar(300) '$.Key', PayloadJson nvarchar(max)) r
+            CROSS APPLY OPENJSON(entries.value)
+                WITH (RecordKey nvarchar(300) '$.Key', PayloadJson nvarchar(max), [RowCount] int) r
         )
-        INSERT batch.Job(NodeId, Kind, RecordKey, PayloadJson)
-        SELECT @NodeId, 'Task', r.RecordKey, r.PayloadJson
+        INSERT batch.Job(NodeId, Kind, RecordKey, PayloadJson, [RowCount])
+        OUTPUT inserted.[RowCount] INTO @Staged
+        SELECT @NodeId, 'Task', r.RecordKey, r.PayloadJson, r.[RowCount]
         FROM PageRecords r WHERE r.RowNumber = 1 AND NOT EXISTS (
             SELECT 1 FROM batch.Job j
             WHERE j.NodeId = @NodeId AND j.Kind = 'Task' AND j.RecordKey = r.RecordKey COLLATE Latin1_General_100_BIN2
         );
-        SET @Inserted = @@ROWCOUNT;
-        UPDATE batch.Node SET TotalTasks = TotalTasks + @Inserted WHERE Id = @NodeId;
+        UPDATE batch.Node SET TotalTasks = TotalTasks + staged.Tasks, TotalRecords = TotalRecords + staged.Records
+        FROM (SELECT COUNT(*) AS Tasks, COALESCE(SUM(CONVERT(bigint, [RowCount])), 0) AS Records FROM @Staged) staged
+        WHERE Id = @NodeId;
 
         IF @NextCursor IS NOT NULL
         BEGIN
@@ -210,7 +215,7 @@ BEGIN
         WITH (Id bigint, Token uniqueidentifier, Status varchar(8), Retryable bit,
             OutputJson nvarchar(max), Error nvarchar(2000), Records nvarchar(max) AS JSON, NextCursor nvarchar(600));
     DECLARE @RunId uniqueidentifier, @Resource nvarchar(255), @LockResult int;
-    DECLARE @Changed table(NodeId uniqueidentifier, Status varchar(8));
+    DECLARE @Changed table(NodeId uniqueidentifier, Status varchar(8), [RowCount] bigint);
     DECLARE @Done table(NodeId uniqueidentifier PRIMARY KEY, Status varchar(8));
 
     BEGIN TRANSACTION;
@@ -236,7 +241,7 @@ BEGIN
             THEN DATEADD(second, batch.BackoffSeconds(j.Attempts), SYSUTCDATETIME()) ELSE j.AvailableAt END,
         FinishedAt = CASE WHEN retry.ShouldRetry = 0 THEN SYSUTCDATETIME() END,
         LeaseToken = NULL, LeaseUntil = NULL, OutputJson = r.OutputJson, Error = r.Error
-    OUTPUT inserted.NodeId, inserted.Status INTO @Changed
+    OUTPUT inserted.NodeId, inserted.Status, inserted.[RowCount] INTO @Changed
     FROM @Result r JOIN batch.Job j ON j.Id = r.Id
     JOIN batch.Node n ON n.Id = j.NodeId
     CROSS APPLY (VALUES (CASE WHEN r.Status = 'Failed' AND r.Retryable = 1 AND j.Attempts < n.MaxAttempts
@@ -248,12 +253,20 @@ BEGIN
     UPDATE n SET RunningTasks = n.RunningTasks - c.Amount,
         SucceededTasks = n.SucceededTasks + c.Successes,
         InvalidTasks = n.InvalidTasks + c.Invalids,
-        FailedTasks = n.FailedTasks + c.Failures
+        FailedTasks = n.FailedTasks + c.Failures,
+        RunningRecords = n.RunningRecords - c.Records,
+        SucceededRecords = n.SucceededRecords + c.SuccessfulRecords,
+        InvalidRecords = n.InvalidRecords + c.InvalidRecords,
+        FailedRecords = n.FailedRecords + c.FailedRecords
     FROM batch.Node n JOIN (
         SELECT NodeId, COUNT(*) AS Amount,
             SUM(CASE WHEN Status = 'Success' THEN 1 ELSE 0 END) AS Successes,
             SUM(CASE WHEN Status = 'Invalid' THEN 1 ELSE 0 END) AS Invalids,
-            SUM(CASE WHEN Status = 'Failed' THEN 1 ELSE 0 END) AS Failures
+            SUM(CASE WHEN Status = 'Failed' THEN 1 ELSE 0 END) AS Failures,
+            SUM([RowCount]) AS Records,
+            SUM(CASE WHEN Status = 'Success' THEN [RowCount] ELSE 0 END) AS SuccessfulRecords,
+            SUM(CASE WHEN Status = 'Invalid' THEN [RowCount] ELSE 0 END) AS InvalidRecords,
+            SUM(CASE WHEN Status = 'Failed' THEN [RowCount] ELSE 0 END) AS FailedRecords
         FROM @Changed GROUP BY NodeId
     ) c ON c.NodeId = n.Id;
 

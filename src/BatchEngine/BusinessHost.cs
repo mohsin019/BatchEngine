@@ -136,7 +136,8 @@ internal static partial class BusinessHost
             if (record is null)
                 throw new InvalidDataException("FetchRecordsAsync returned a null record");
             Protocol.Key(record.Key, "Record key", 300);
-            records.Add(new(record.Key, Protocol.Value(record.Payload, "Record payload", Protocol.ValueBytes)));
+            records.Add(new(record.Key, Protocol.Value(record.Payload, "Record payload", Protocol.ValueBytes),
+                record.RowCount));
         }
         if (JsonSerializer.SerializeToUtf8Bytes(records, Protocol.Json).Length > Protocol.PageBytes)
             throw new InvalidDataException("A fetch page may contain up to 4 MiB of serialized records");

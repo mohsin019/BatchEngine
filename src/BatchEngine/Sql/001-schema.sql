@@ -117,12 +117,29 @@ BEGIN
 END;
 GO
 
+IF COL_LENGTH('batch.Job', 'RowCount') IS NULL
+    ALTER TABLE batch.Job ADD [RowCount] int NOT NULL DEFAULT 1 CHECK ([RowCount] > 0);
+GO
+
+IF COL_LENGTH('batch.Node', 'TotalRecords') IS NULL
+BEGIN
+    ALTER TABLE batch.Node ADD TotalRecords bigint NOT NULL DEFAULT 0, RunningRecords bigint NOT NULL DEFAULT 0,
+        SucceededRecords bigint NOT NULL DEFAULT 0, InvalidRecords bigint NOT NULL DEFAULT 0,
+        FailedRecords bigint NOT NULL DEFAULT 0;
+
+    -- Before result-set volumes, every task represented one record.
+    EXEC(N'UPDATE batch.Node SET TotalRecords = TotalTasks, RunningRecords = RunningTasks,
+        SucceededRecords = SucceededTasks, InvalidRecords = InvalidTasks, FailedRecords = FailedTasks
+        WHERE TotalTasks > 0');
+END;
+GO
+
 CREATE OR ALTER VIEW batch.TaskStatus AS
 SELECT n.RunId, n.NodeKey AS ProcessKey, j.Id, j.RecordKey,
     CASE WHEN n.TasksReleased = 1 THEN j.Status
          WHEN n.OwnStatus IS NULL THEN 'Staged'
          ELSE 'Skipped' END AS Status,
-    j.Attempts, j.WorkerId, j.OutputJson, j.Error, j.StartedAt, j.FinishedAt
+    j.Attempts, j.WorkerId, j.OutputJson, j.Error, j.StartedAt, j.FinishedAt, j.[RowCount]
 FROM batch.Node n JOIN batch.Job j ON j.NodeId = n.Id
 WHERE j.Kind = 'Task';
 GO

@@ -50,7 +50,7 @@ internal sealed record JobLease(
     Guid LeaseToken, int TimeoutSeconds, string? OwnStatus, long TotalTasks,
     long SucceededTasks, long InvalidTasks, long FailedTasks, long SkippedTasks, string? ProcessError);
 
-internal sealed record FetchedRecord(string Key, string PayloadJson);
+internal sealed record FetchedRecord(string Key, string PayloadJson, int RowCount);
 internal sealed record AttemptResult(
     string Status, bool Retryable = false, string? OutputJson = null, string? Error = null,
     IReadOnlyList<FetchedRecord>? Records = null, string? NextCursor = null)
