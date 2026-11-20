@@ -6,7 +6,7 @@ namespace BatchEngine;
 
 internal sealed class PluginRegistry
 {
-    private readonly Dictionary<string, Type> handlers = new(StringComparer.Ordinal);
+    private readonly Dictionary<(string Name, Type Contract), Type> handlers = new();
 
     internal PluginRegistry()
     {
@@ -19,26 +19,31 @@ internal sealed class PluginRegistry
         }
     }
 
-    internal bool Contains(string name) => handlers.ContainsKey(name);
+    internal bool Contains<T>(string name) => handlers.ContainsKey((name, typeof(T)));
 
-    internal IBatchProcess Create(string name) => handlers.TryGetValue(name, out var type)
-        ? (IBatchProcess)Activator.CreateInstance(type)!
+    internal T Create<T>(string name) => handlers.TryGetValue((name, typeof(T)), out var type)
+        ? (T)Activator.CreateInstance(type)!
         : throw new PermanentProcessException($"Handler '{name}' is unavailable");
 
     private void Register(Assembly assembly)
     {
         foreach (var type in assembly.GetTypes())
         {
-            var descriptor = type.GetCustomAttribute<ProcessHandlerAttribute>();
-            if (descriptor is null)
-                continue;
-            Protocol.Key(descriptor.Name, "Handler name", 128);
-            if (!type.IsClass || type.IsAbstract || !typeof(IBatchProcess).IsAssignableFrom(type) ||
-                type.GetConstructor(Type.EmptyTypes) is null)
-                throw new InvalidOperationException($"{type.FullName} must be a concrete IBatchProcess with a public parameterless constructor");
-            if (!handlers.TryAdd(descriptor.Name, type))
-                throw new InvalidOperationException($"Handler '{descriptor.Name}' is registered twice");
+            if (type.GetCustomAttribute<ProcessHandlerAttribute>() is { } process)
+                Register(typeof(IBatchProcess), process.Name, type);
+            if (type.GetCustomAttribute<GroupHandlerAttribute>() is { } group)
+                Register(typeof(IBatchGroup), group.Name, type);
         }
+    }
+
+    private void Register(Type contract, string name, Type type)
+    {
+        Protocol.Key(name, "Handler name", 128);
+        if (!type.IsClass || type.IsAbstract || !contract.IsAssignableFrom(type) ||
+            type.GetConstructor(Type.EmptyTypes) is null)
+            throw new InvalidOperationException($"{type.FullName} must be a concrete {contract.Name} with a public parameterless constructor");
+        if (!handlers.TryAdd((name, contract), type))
+            throw new InvalidOperationException($"Handler '{name}' is registered twice for {contract.Name}");
     }
 
     private sealed class PluginLoadContext(string mainPath) : AssemblyLoadContext

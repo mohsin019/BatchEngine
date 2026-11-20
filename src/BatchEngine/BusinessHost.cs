@@ -48,12 +48,27 @@ internal static partial class BusinessHost
         var ct = timeout.Token;
         try
         {
-            var plugin = plugins.Create(job.Handler);
             var options = Protocol.Parse(job.OptionsJson);
             var key = $"{job.RunId:N}:{job.Id}";
             if (job.Kind == "Fetch" && job.Cursor is not null)
                 key += ":" + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(job.Cursor)));
 
+            if (job.NodeKind == "Group")
+            {
+                var groupPlugin = plugins.Create<IBatchGroup>(job.Handler);
+                var group = new GroupContext(job.RunId, job.ProcessKey, options, job.Attempts,
+                    key, request.WorkerId, shared, Protocol.Parse(job.InputJson!));
+                if (job.Kind == "Start")
+                    await groupPlugin.BeforeGroupAsync(group, ct);
+                else if (job.Kind == "Finish")
+                    await groupPlugin.AfterGroupAsync(group, new GroupOutcome(
+                        Enum.Parse<BusinessStatus>(job.OwnStatus!), job.ProcessError), ct);
+                else
+                    throw new PermanentProcessException("Unknown group job stage");
+                return new("Success");
+            }
+
+            var plugin = plugins.Create<IBatchProcess>(job.Handler);
             if (job.Kind == "Task")
             {
                 var context = new TaskContext(job.RunId, job.ProcessKey, options, job.Attempts,
@@ -83,7 +98,7 @@ internal static partial class BusinessHost
         }
         catch (Exception exception)
         {
-            return Classify(exception, allowInvalid: job.Kind != "Finish");
+            return Classify(exception, allowInvalid: job.NodeKind != "Group" && job.Kind != "Finish");
         }
     }
 

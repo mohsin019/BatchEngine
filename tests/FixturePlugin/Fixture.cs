@@ -25,6 +25,12 @@ public sealed class Fixture : IBatchProcess
         if (await context.Shared.GetAsync("start." + context.ProcessKey, ct) is null)
             throw new PermanentProcessException("Before-process hook did not run");
         var from = cursor is null ? 0 : int.Parse(cursor, CultureInfo.InvariantCulture);
+        if (Mode(context.Options) == "hold-fetch" && cursor is not null && context.Attempt == 1)
+        {
+            await context.Shared.PutAsync("fetch.waiting", JsonSerializer.SerializeToElement(cursor),
+                cancellationToken: ct);
+            await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+        }
         var count = context.Options.GetProperty("count").GetInt32();
         var to = Math.Min(count, from + limit);
         var records = Enumerable.Range(from, to - from).Select(i =>

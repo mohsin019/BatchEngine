@@ -134,6 +134,23 @@ Submit the group by key with its revision, a submissionKey for safe retries, and
 
 A stale group revision returns HTTP 409. Repeating a submission with the same key, group revision and input returns the original run ID. SQL Server stores the group definition snapshot on submission. Workers accept that snapshot from the queue and execute its processes one at a time in tree order. Each process still uses its own parallel task limit across workers. Independent runs can execute concurrently.
 
+## Group lifecycle hooks
+
+Implement IBatchGroup in a business plugin and give the class a GroupHandler attribute with its registered name. Deploy the plugin to all workers. Add lifecycle to a group node in a workflow or to the root group body in PUT /api/groups/{key}. Nested groups can each have their own lifecycle settings.
+
+~~~json
+{
+  "handler": "orders.batch-group.v1",
+  "max_attempts": 3,
+  "timeout_seconds": 60,
+  "options": {"notify": true}
+}
+~~~
+
+BeforeGroupAsync runs before any child starts. AfterGroupAsync runs after the group’s children finish and receives their combined Success, Invalid, or Failed outcome. When the start hook fails permanently or exhausts retries, the engine skips the children and still calls the finish hook with Failed. A finish hook that exhausts its retries marks the group Failed.
+
+Each hook is a leased job. Its attempt limit and deadline apply independently, and another node can recover an expired lease. Use GroupContext.IdempotencyKey for external effects that need deduplication across retries. Run init-db and deploy the updated workers before enabling group hooks.
+
 ## Monitor a running workflow
 
 Run the updated executable with init-db on an existing batch database to install the progress views. The views also cover earlier submissions. While a workflow runs, use status with a task limit of zero to see its run totals and each process's counts.
@@ -191,6 +208,8 @@ return new RecordPage(volumes, nextCursor);
 
 SQL Server saves each volume with its result rows. The worker that leases the task passes those rows as a JSON array to BeforeTaskAsync, RunTaskAsync and AfterTaskAsync. Deserialize the array with resultSet.Deserialize<OrderRow[]>() or iterate it with EnumerateArray(). A retry receives the same saved result set. The integration fixture DatabaseVolumes.cs contains a working SQL query, cursor, and RunTaskAsync implementation.
 
+SQL Server commits the page’s task rows, progress counters, and next cursor together. If the save rolls back, the previous cursor stays in place. An expired fetch lease lets a worker fetch the same page again. Tasks are released after the last page commits. Use stable source pagination and unique volume keys. The engine deduplicates reused keys and can only persist rows the fetch method returned.
+
 Size each volume within the 256 KiB payload limit and each fetch page within 4 MiB. One task outcome applies to its entire volume. When rows need independent retry or outcome tracking, return a separate task per row.
 
 Use stable record keys and stable keyset pagination over the source records. The engine keeps one task per process and record key, preserving the first accepted payload. A repeated cursor fails the fetch. A business rejection can also be signaled by BusinessInvalidException in start, fetch, or task work. Exceptions retry with exponential backoff up to the attempt limit. An after-task hook failure retries the task attempt. PermanentProcessException fails immediately.
@@ -213,7 +232,7 @@ The engine batches claims, renewals, and settlements, uses filtered queue indexe
 
 ## Verification
 
-The integration executable starts two independent workers, loads a separate business plugin assembly, and submits work both directly to SQL Server and through the group API. It checks hierarchy editing and snapshots, editable process configurations, parallel result-set volumes, live task and record counts, tree order, cross-worker task execution, staged fetches, both business outcomes, retries, task hooks, permanent failures, hard timeouts and recovery after a worker crash.
+The integration executable starts two independent workers, loads a separate business plugin assembly, and submits work both directly to SQL Server and through the group API. It checks hierarchy editing and snapshots, group hooks, fetch rollback and recovery, editable process configurations, parallel result-set volumes, live task and record counts, tree order, cross-worker task execution, staged fetches, both business outcomes, retries, task hooks, permanent failures, hard timeouts and recovery after a worker crash.
 
 ~~~sh
 export BATCH_TEST_SQL_CONNECTION='<disposable-sql-server-database-connection-string>'

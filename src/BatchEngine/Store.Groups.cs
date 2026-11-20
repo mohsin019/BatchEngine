@@ -43,7 +43,8 @@ internal sealed partial class Store
         await using var command = new SqlCommand("""
             DECLARE @Json nvarchar(max) = (
                 SELECT GroupKey AS [key], DisplayName AS displayName, Revision AS revision,
-                    UpdatedAt AS updatedAt, JSON_QUERY(DefinitionJson, '$.children') AS children
+                    UpdatedAt AS updatedAt, JSON_QUERY(DefinitionJson, '$.children') AS children,
+                    JSON_QUERY(DefinitionJson, '$.lifecycle') AS lifecycle
                 FROM batch.ProcessGroup WHERE GroupKey = @GroupKey
                 FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
             );

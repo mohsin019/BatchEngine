@@ -63,6 +63,11 @@ BEGIN
 END;
 GO
 
+IF COL_LENGTH('batch.Node', 'GroupHandler') IS NULL
+    ALTER TABLE batch.Node ADD GroupHandler nvarchar(128) COLLATE Latin1_General_100_BIN2 NULL,
+        CONSTRAINT CK_BatchNode_GroupHandler CHECK (GroupHandler IS NULL OR Kind = 'Group');
+GO
+
 IF OBJECT_ID('batch.Job', 'U') IS NULL
 BEGIN
     CREATE TABLE batch.Job (
@@ -172,7 +177,7 @@ END;
 GO
 
 -- All transitions for a running tree take its run-specific transaction lock.
-CREATE OR ALTER PROCEDURE batch.MoveTree @NodeId uniqueidentifier, @Action char(1)
+CREATE OR ALTER PROCEDURE batch.MoveTree @NodeId uniqueidentifier, @Action char(1), @FinalOutcome varchar(8) = NULL
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -180,11 +185,11 @@ BEGIN
         Sequence int IDENTITY PRIMARY KEY, NodeId uniqueidentifier NOT NULL,
         Action char(1) NOT NULL, Outcome varchar(8) NULL
     );
-    INSERT @Work (NodeId, Action) VALUES (@NodeId, @Action);
+    INSERT @Work (NodeId, Action, Outcome) VALUES (@NodeId, @Action, @FinalOutcome);
 
     DECLARE @Sequence int, @ParentId uniqueidentifier, @RunId uniqueidentifier,
         @Kind varchar(8), @Mode varchar(8), @Own varchar(8), @Children varchar(8),
-        @Outcome varchar(8), @Remaining int;
+        @Outcome varchar(8), @Remaining int, @GroupHandler nvarchar(128), @Phase varchar(12);
     WHILE EXISTS (SELECT 1 FROM @Work)
     BEGIN
         SELECT TOP (1) @Sequence = Sequence, @NodeId = NodeId, @Action = Action, @Outcome = Outcome
@@ -193,14 +198,14 @@ BEGIN
 
         IF @Action = 'S'
         BEGIN
-            SELECT @Kind = Kind FROM batch.Node WHERE Id = @NodeId;
+            SELECT @Kind = Kind, @GroupHandler = GroupHandler FROM batch.Node WHERE Id = @NodeId;
+            SET @Phase = CASE WHEN @Kind = 'Group' AND @GroupHandler IS NULL THEN 'Children' ELSE 'Start' END;
             UPDATE batch.Node SET Status = 'Running', StartedAt = SYSUTCDATETIME(),
-                Phase = CASE WHEN @Kind = 'Group' THEN 'Children' ELSE 'Start' END,
-                OwnStatus = CASE WHEN @Kind = 'Group' THEN 'Success' END
+                Phase = @Phase, OwnStatus = CASE WHEN @Phase = 'Children' THEN 'Success' END
             WHERE Id = @NodeId AND Phase = 'Waiting';
             IF @@ROWCOUNT <> 1 THROW 51010, 'Node is not waiting', 1;
 
-            IF @Kind = 'Process' INSERT batch.Job (NodeId, Kind) VALUES (@NodeId, 'Start');
+            IF @Phase = 'Start' INSERT batch.Job (NodeId, Kind) VALUES (@NodeId, 'Start');
             ELSE INSERT @Work (NodeId, Action) VALUES (@NodeId, 'O');
         END
         ELSE IF @Action = 'O'
@@ -222,6 +227,14 @@ BEGIN
         END
         ELSE
         BEGIN
+            SELECT @GroupHandler = GroupHandler, @Phase = Phase FROM batch.Node WHERE Id = @NodeId;
+            IF @GroupHandler IS NOT NULL AND @Phase <> 'Finish'
+            BEGIN
+                UPDATE batch.Node SET Phase = 'Finish' WHERE Id = @NodeId;
+                INSERT batch.Job (NodeId, Kind) VALUES (@NodeId, 'Finish');
+                CONTINUE;
+            END;
+
             UPDATE batch.Node SET Status = @Outcome, Phase = 'Done', FinishedAt = SYSUTCDATETIME()
             WHERE Id = @NodeId;
             SELECT @ParentId = ParentId, @RunId = RunId FROM batch.Node WHERE Id = @NodeId;
@@ -273,12 +286,13 @@ BEGIN
         IF @@ROWCOUNT = 1 AND @Error IS NULL
         BEGIN
             INSERT batch.Node (Id, RunId, ParentId, Position, NodeKey, Kind, ChildrenMode,
-                Handler, OptionsJson, MaxParallelTasks, MaxAttempts, TimeoutSeconds, RemainingChildren)
+                Handler, OptionsJson, MaxParallelTasks, MaxAttempts, TimeoutSeconds, RemainingChildren, GroupHandler)
             SELECT Id, @Id, ParentId, Position, NodeKey, Kind, ChildrenMode, Handler,
-                OptionsJson, MaxParallelTasks, MaxAttempts, TimeoutSeconds, ChildCount
+                OptionsJson, MaxParallelTasks, MaxAttempts, TimeoutSeconds, ChildCount, GroupHandler
             FROM OPENJSON(@Nodes) WITH (Id uniqueidentifier, ParentId uniqueidentifier, Position int,
                 NodeKey nvarchar(64), Kind varchar(8), ChildrenMode varchar(8), Handler nvarchar(128),
-                OptionsJson nvarchar(max), MaxParallelTasks int, MaxAttempts int, TimeoutSeconds int, ChildCount int);
+                OptionsJson nvarchar(max), MaxParallelTasks int, MaxAttempts int, TimeoutSeconds int, ChildCount int,
+                GroupHandler nvarchar(128));
             SELECT @Root = Id FROM batch.Node WHERE RunId = @Id AND ParentId IS NULL;
             EXEC batch.MoveTree @Root, 'S';
         END;

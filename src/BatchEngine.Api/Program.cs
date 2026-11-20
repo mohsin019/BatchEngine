@@ -68,11 +68,16 @@ api.MapPut("/groups/{key}", async (string key, SaveGroupRequest request, Cancell
     if (request.ExpectedRevision is null or < 0 || request.Children.ValueKind != JsonValueKind.Array)
         throw new InvalidDataException("Provide a nonnegative expectedRevision and a children array.");
 
-    var definition = JsonSerializer.SerializeToElement(new { key, type = "group", children = request.Children }, Protocol.Json);
+    var definition = request.Lifecycle.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null
+        ? JsonSerializer.SerializeToElement(new { key, type = "group", children = request.Children }, Protocol.Json)
+        : JsonSerializer.SerializeToElement(new
+        {
+            key, type = "group", children = request.Children, lifecycle = request.Lifecycle
+        }, Protocol.Json);
     var json = Protocol.Value(definition, "Group definition", Protocol.SubmissionBytes);
     var submission = new QueuedSubmission(Guid.Empty, json, "{}", SavedGroup: true);
     var configurations = await store.ReadConfigurationsAsync(Workflow.ConfigurationKeys(submission).ToArray(), ct);
-    var validation = Workflow.Prepare(submission, _ => true, configurations);
+    var validation = Workflow.Prepare(submission, configurations);
     if (validation.Error is not null)
         throw new InvalidDataException(validation.Error);
 
@@ -131,5 +136,5 @@ static int PageSize(int? limit) => (limit ?? 100) switch
     var size => size
 };
 
-internal sealed record SaveGroupRequest(string? DisplayName, long? ExpectedRevision, JsonElement Children);
+internal sealed record SaveGroupRequest(string? DisplayName, long? ExpectedRevision, JsonElement Children, JsonElement Lifecycle);
 internal sealed record SubmitGroupRequest(long? Revision, string? SubmissionKey, JsonElement Input);

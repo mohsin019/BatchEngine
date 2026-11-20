@@ -1,12 +1,13 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using BatchEngine.Contracts;
 
 namespace BatchEngine;
 
 internal sealed record PlanNode(
     Guid Id, Guid? ParentId, int Position, string NodeKey, string Kind, string ChildrenMode,
-    string? Handler, string OptionsJson, int MaxParallelTasks, int MaxAttempts, int TimeoutSeconds, int ChildCount);
+    string? Handler, string OptionsJson, int MaxParallelTasks, int MaxAttempts, int TimeoutSeconds, int ChildCount, string? GroupHandler);
 internal sealed record QueuedSubmission(Guid Id, string? DefinitionJson, string? InputJson, bool SavedGroup = false);
 internal sealed record Intake(Guid Id, PlanNode[]? Nodes, string? Error);
 internal sealed record ProcessConfiguration(string Handler, string ChildrenMode, string OptionsJson,
@@ -50,8 +51,8 @@ internal static partial class Workflow
         }
     }
 
-    internal static Intake Prepare(QueuedSubmission submission, Func<string, bool> hasHandler,
-        IReadOnlyDictionary<string, ProcessConfiguration> configurations)
+    internal static Intake Prepare(QueuedSubmission submission,
+        IReadOnlyDictionary<string, ProcessConfiguration> configurations, PluginRegistry? plugins = null)
     {
         try
         {
@@ -97,6 +98,8 @@ internal static partial class Workflow
                 }
                 else if (kind == "process")
                     allowed.UnionWith(["handler", "options", "max_parallel_tasks", "max_attempts", "timeout_seconds"]);
+                else
+                    allowed.Add("lifecycle");
                 foreach (var property in node.EnumerateObject())
                     if (!allowed.Remove(property.Name))
                         throw new InvalidDataException($"{key}: unknown or repeated field {property.Name}");
@@ -126,10 +129,28 @@ internal static partial class Workflow
                 }
 
                 var handler = configuration?.Handler ?? (kind == "process" ? RequiredString(node, "handler") : null);
-                if (handler is not null && !hasHandler(handler))
+                if (handler is not null && plugins is not null && !plugins.Contains<IBatchProcess>(handler))
                     throw new InvalidDataException($"{key}: handler '{handler}' is not registered");
+
+                var settings = node;
+                string? groupHandler = null;
+                if (node.TryGetProperty("lifecycle", out var lifecycle))
+                {
+                    if (lifecycle.ValueKind != JsonValueKind.Object)
+                        throw new InvalidDataException($"{key}: lifecycle must be a JSON object");
+                    var lifecycleFields = new HashSet<string>(["handler", "options", "max_attempts", "timeout_seconds"]);
+                    foreach (var property in lifecycle.EnumerateObject())
+                        if (!lifecycleFields.Remove(property.Name))
+                            throw new InvalidDataException($"{key}: unknown or repeated lifecycle field {property.Name}");
+                    groupHandler = RequiredString(lifecycle, "handler");
+                    Protocol.Key(groupHandler, "Group handler name", 128);
+                    if (plugins is not null && !plugins.Contains<IBatchGroup>(groupHandler))
+                        throw new InvalidDataException($"{key}: group handler '{groupHandler}' is not registered");
+                    settings = lifecycle;
+                }
+
                 var options = configuration is not null ? Protocol.Parse(configuration.OptionsJson) :
-                    node.TryGetProperty("options", out var value) ? value : Protocol.Parse("{}");
+                    settings.TryGetProperty("options", out var value) ? value : Protocol.Parse("{}");
                 if (options.ValueKind != JsonValueKind.Object)
                     throw new InvalidDataException($"{key}: options must be a JSON object");
                 var optionsJson = Protocol.Value(options, "Process options", 64 * 1024);
@@ -137,8 +158,9 @@ internal static partial class Workflow
                 var item = new PlanNode(Guid.NewGuid(), parent?.Id, position, key,
                     kind == "group" ? "Group" : "Process", mode, handler, optionsJson,
                     configuration?.MaxParallelTasks ?? Integer(node, "max_parallel_tasks", 1, 256),
-                    configuration?.MaxAttempts ?? Integer(node, "max_attempts", 3, 20),
-                    configuration?.TimeoutSeconds ?? Integer(node, "timeout_seconds", 60, 86400), children.Length);
+                    configuration?.MaxAttempts ?? Integer(settings, "max_attempts", 3, 20),
+                    configuration?.TimeoutSeconds ?? Integer(settings, "timeout_seconds", 60, 86400),
+                    children.Length, groupHandler);
                 nodes.Add(item);
 
                 for (var index = 0; index < children.Length; index++)

@@ -8,6 +8,12 @@ public sealed class ProcessHandlerAttribute(string name) : Attribute
     public string Name { get; } = name;
 }
 
+[AttributeUsage(AttributeTargets.Class, Inherited = false)]
+public sealed class GroupHandlerAttribute(string name) : Attribute
+{
+    public string Name { get; } = name;
+}
+
 public enum BusinessStatus { Success, Invalid, Failed }
 
 public sealed record Record(string Key, JsonElement Payload)
@@ -78,5 +84,20 @@ public interface IBatchProcess
     ValueTask AfterTaskAsync(TaskContext context, JsonElement record, AttemptOutcome outcome,
         CancellationToken cancellationToken) => ValueTask.CompletedTask;
     ValueTask AfterProcessAsync(ProcessContext context, ProcessOutcome outcome, CancellationToken cancellationToken) =>
+        ValueTask.CompletedTask;
+}
+
+public sealed record GroupContext(
+    Guid RunId, string GroupKey, JsonElement Options, int Attempt,
+    string IdempotencyKey, string WorkerId, ISharedData Shared, JsonElement Input);
+
+public sealed record GroupOutcome(BusinessStatus Status, string? Error);
+
+public interface IBatchGroup
+{
+    ValueTask BeforeGroupAsync(GroupContext context, CancellationToken cancellationToken) =>
+        ValueTask.CompletedTask;
+
+    ValueTask AfterGroupAsync(GroupContext context, GroupOutcome outcome, CancellationToken cancellationToken) =>
         ValueTask.CompletedTask;
 }

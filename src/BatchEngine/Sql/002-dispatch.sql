@@ -68,12 +68,16 @@ BEGIN
     END;
 
     SET @Payload = (
-        SELECT j.Id, n.RunId, n.NodeKey AS ProcessKey, j.Kind, n.Handler, n.OptionsJson,
+        SELECT j.Id, n.RunId, n.NodeKey AS ProcessKey, j.Kind, n.Kind AS NodeKind,
+            COALESCE(n.Handler, n.GroupHandler) AS Handler, n.OptionsJson,
             CASE WHEN j.Kind <> 'Task' THEN s.InputJson END AS InputJson,
             j.RecordKey, j.PayloadJson, j.CursorValue AS [Cursor], j.Attempts, j.LeaseToken, n.TimeoutSeconds,
-            n.OwnStatus, n.TotalTasks, n.SucceededTasks, n.InvalidTasks, n.FailedTasks,
+            CASE WHEN n.Kind = 'Group' AND j.Kind = 'Finish' THEN batch.MergeStatus(n.OwnStatus, n.ChildrenStatus)
+                 ELSE n.OwnStatus END AS OwnStatus,
+            n.TotalTasks, n.SucceededTasks, n.InvalidTasks, n.FailedTasks,
             CASE WHEN n.TasksReleased = 1 THEN CONVERT(bigint, 0) ELSE n.TotalTasks END AS SkippedTasks,
-            n.Error AS ProcessError
+            COALESCE(n.Error, CASE WHEN n.Kind = 'Group' AND j.Kind = 'Finish' AND n.ChildrenStatus = 'Failed'
+                THEN N'One or more children failed' END) AS ProcessError
         FROM @Claimed c JOIN batch.Job j ON c.Id = j.Id
         JOIN batch.Node n ON j.NodeId = n.Id JOIN batch.Submission s ON n.RunId = s.Id
         FOR JSON PATH, INCLUDE_NULL_VALUES
@@ -117,8 +121,9 @@ CREATE OR ALTER PROCEDURE batch.SettleStage
 AS
 BEGIN
     SET NOCOUNT ON;
-    DECLARE @NodeId uniqueidentifier, @Kind varchar(8), @Attempts int, @MaxAttempts int;
-    SELECT @NodeId = j.NodeId, @Kind = j.Kind, @Attempts = j.Attempts, @MaxAttempts = n.MaxAttempts
+    DECLARE @NodeId uniqueidentifier, @Kind varchar(8), @NodeKind varchar(8), @Attempts int, @MaxAttempts int;
+    SELECT @NodeId = j.NodeId, @Kind = j.Kind, @NodeKind = n.Kind,
+        @Attempts = j.Attempts, @MaxAttempts = n.MaxAttempts
     FROM batch.Job j WITH (UPDLOCK) JOIN batch.Node n ON n.Id = j.NodeId
     WHERE j.Id = @Id AND j.LeaseToken = @Token AND j.Status = 'Running'
         AND ((@Expired = 1 AND j.LeaseUntil <= SYSUTCDATETIME()) OR
@@ -178,6 +183,25 @@ BEGIN
 
     UPDATE batch.Job SET Status = @Status, LeaseToken = NULL, LeaseUntil = NULL,
         Error = @Error, FinishedAt = SYSUTCDATETIME() WHERE Id = @Id;
+
+    IF @NodeKind = 'Group'
+    BEGIN
+        IF @Kind = 'Start'
+        BEGIN
+            UPDATE batch.Node SET OwnStatus = @Status, Error = @Error WHERE Id = @NodeId;
+            EXEC batch.MoveTree @NodeId, 'O';
+        END
+        ELSE
+        BEGIN
+            IF @Status <> 'Success'
+                UPDATE batch.Node SET OwnStatus = batch.MergeStatus(OwnStatus, @Status),
+                    Error = CONCAT_WS(N' / ', Error, @Error) WHERE Id = @NodeId;
+            DECLARE @GroupOutcome varchar(8);
+            SELECT @GroupOutcome = batch.MergeStatus(OwnStatus, ChildrenStatus) FROM batch.Node WHERE Id = @NodeId;
+            EXEC batch.MoveTree @NodeId, 'C', @GroupOutcome;
+        END;
+        RETURN;
+    END;
 
     IF @Kind = 'Start' AND @Status = 'Success'
     BEGIN

@@ -19,6 +19,8 @@ var workers = new List<Process>();
 try
 {
     await GroupApiAsync();
+    await GroupFailureAsync();
+    await FetchRecoveryAsync();
     await ConfiguredVolumesAsync();
     await HierarchyAsync();
     await FailuresAsync();
@@ -255,7 +257,10 @@ async Task GroupApiAsync()
         });
         client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
 
-        var nestedMember = new { key = "nested", type = "group", children = new[] { Configured("first", heldConfig) } };
+        var nestedMember = new
+        {
+            key = "nested", type = "group", lifecycle = GroupLifecycle(), children = new[] { Configured("first", heldConfig) }
+        };
         var second = Configured("second", nextConfig, Configured("third", nextConfig), Configured("fourth", nextConfig));
 
         var list = await client.GetFromJsonAsync<JsonElement>($"/api/process-configurations?afterKey={group}");
@@ -276,6 +281,8 @@ async Task GroupApiAsync()
         Equal(HttpStatusCode.OK, reordered.StatusCode, "the frontend can reorder the hierarchy");
         var saved = await client.GetFromJsonAsync<JsonElement>($"/api/groups/{group}");
         Equal(2L, saved.GetProperty("revision").GetInt64(), "group revision");
+        Equal("integration.group.v1", saved.GetProperty("lifecycle").GetProperty("handler").GetString(),
+            "group lifecycle settings round-trip through the API");
         Equal("nested", saved.GetProperty("children")[0].GetProperty("key").GetString(), "group detail includes the new order");
 
         using var staleEdit = await SaveAsync(1, second);
@@ -325,7 +332,25 @@ async Task GroupApiAsync()
                   OR (a.NodeKey='third' AND b.NodeKey='fourth')
                   OR (a.NodeKey='nested' AND b.NodeKey='second'))
             """, run), "the saved hierarchy and process children execute in order");
-        Console.WriteLine("Passed group API editing, revision snapshots, durable submission and sequential processes.");
+        Equal(2, await QueryAsync<int>("""
+            SELECT j.Attempts FROM batch.Job j JOIN batch.Node n ON n.Id=j.NodeId
+            WHERE n.RunId=@Run AND n.ParentId IS NULL AND j.Kind='Finish' AND j.Status='Success'
+            """, run), "root finish hook retried independently");
+        Equal(4, await QueryAsync<int>("""
+            SELECT COUNT(*) FROM batch.SharedData WHERE RunId=@Run
+                AND ([Key] LIKE 'group.start.%' OR [Key] LIKE 'group.finish.%')
+            """, run), "root and nested start and finish hooks ran");
+        Equal(2, await QueryAsync<int>("""
+            SELECT COUNT(*) FROM batch.Node n
+            JOIN batch.Job start ON start.NodeId=n.Id AND start.Kind='Start'
+            JOIN batch.Job finish ON finish.NodeId=n.Id AND finish.Kind='Finish'
+            WHERE n.RunId=@Run AND n.Kind='Group'
+                AND NOT EXISTS (
+                    SELECT 1 FROM batch.Node child WHERE child.ParentId=n.Id
+                        AND (child.StartedAt < start.FinishedAt OR child.FinishedAt > finish.StartedAt)
+                )
+            """, run), "group hooks surround the children of both groups");
+        Console.WriteLine("Passed group API editing, revision snapshots, sequential processes and group hooks.");
     }
     finally
     {
@@ -335,10 +360,89 @@ async Task GroupApiAsync()
     }
 
     Task<HttpResponseMessage> SaveAsync(long expectedRevision, params object[] children) =>
-        client.PutAsJsonAsync($"/api/groups/{group}", new { displayName = "Integration group", expectedRevision, children });
+        client.PutAsJsonAsync($"/api/groups/{group}", new
+        {
+            displayName = "Integration group", expectedRevision, children, lifecycle = GroupLifecycle(retryFinish: true)
+        });
 
     static object Configured(string key, string configuration, params object[] children) =>
         new { key, type = "process", configuration, children };
+}
+
+static object GroupLifecycle(bool failStart = false, bool retryFinish = false) =>
+    new { handler = "integration.group.v1", options = new { failStart, retryFinish } };
+
+async Task GroupFailureAsync()
+{
+    var blocked = new
+    {
+        key = "blocked", type = "group", lifecycle = GroupLifecycle(failStart: true),
+        children = new[] { Step("unstarted", 1) }
+    };
+    var failedChild = new
+    {
+        key = "failed-child", type = "group", lifecycle = GroupLifecycle(),
+        children = new[] { Step("fails", 1, mode: "permanent") }
+    };
+
+    var run = await SubmitAsync(Group("root", "parallel", blocked, failedChild));
+    await ExpectStatusAsync(run, "Failed");
+    Equal("Skipped", await QueryAsync<string>("SELECT Status FROM batch.Node WHERE RunId=@Run AND NodeKey='unstarted'", run),
+        "failed group start blocks its children");
+    Equal(2, await QueryAsync<int>("""
+        SELECT COUNT(*) FROM batch.SharedData WHERE RunId=@Run AND [Key] LIKE 'group.finish.%' AND ValueJson=N'"Failed"'
+        """, run), "finish hooks receive failure after a failed start or a failed child");
+    Console.WriteLine("Passed group finish hooks after failures.");
+}
+
+async Task FetchRecoveryAsync()
+{
+    var run = await SubmitAsync(Group("root", "serial", Step("fetch-recovery", 4, mode: "hold-fetch")));
+    await WaitAsync(async () => await QueryAsync<int>("""
+        SELECT COUNT(*) FROM batch.SharedData WHERE RunId=@Run AND [Key]='fetch.waiting'
+        """, run) == 1);
+
+    var claim = await QueryAsync<string>("""
+        SELECT j.Id AS Id, j.LeaseToken AS Token FROM batch.Job j
+        JOIN batch.Node n ON n.Id=j.NodeId WHERE n.RunId=@Run AND j.Kind='Fetch'
+        FOR JSON PATH, WITHOUT_ARRAY_WRAPPER;
+        """, run);
+    using var parsed = JsonDocument.Parse(claim);
+    try
+    {
+        // The second task violates the SQL row-count constraint. The entire page and cursor must roll back.
+        await QueryAsync<int>("EXEC batch.Settle @Run; SELECT 1;", JsonSerializer.Serialize(new[] { new
+        {
+            Id = parsed.RootElement.GetProperty("Id").GetInt64(),
+            Token = parsed.RootElement.GetProperty("Token").GetGuid(),
+            Status = "Success", Retryable = false, NextCursor = "4",
+            Records = new[] { new { Key = "2", PayloadJson = "2", RowCount = 1 }, new { Key = "3", PayloadJson = "3", RowCount = 0 } }
+        } }));
+        throw new InvalidOperationException("A page with an invalid volume was committed.");
+    }
+    catch (SqlException ex) when (ex.Number == 547) { }
+
+    Equal(2L, await QueryAsync<long>("SELECT TotalTasks FROM batch.RunProgress WHERE RunId=@Run", run),
+        "the failed save left the previous page intact");
+    Equal(1, await QueryAsync<int>("""
+        SELECT COUNT(*) FROM batch.Job j JOIN batch.Node n ON n.Id=j.NodeId
+        WHERE n.RunId=@Run AND j.Kind='Fetch' AND j.Status='Running' AND j.CursorValue='2'
+        """, run), "the cursor did not advance on a failed save");
+
+    await QueryAsync<int>("""
+        UPDATE j SET LeaseUntil=DATEADD(second, -1, SYSUTCDATETIME())
+        FROM batch.Job j JOIN batch.Node n ON n.Id=j.NodeId
+        WHERE n.RunId=@Run AND j.Kind='Fetch';
+        SELECT 1;
+        """, run);
+    await ExpectStatusAsync(run, "Success");
+    Equal(4L, await QueryAsync<long>("SELECT ProcessedRecords FROM batch.RunProgress WHERE RunId=@Run", run),
+        "a worker retried the missing page without duplicating the committed page");
+    Equal(2, await QueryAsync<int>("""
+        SELECT j.Attempts FROM batch.Job j JOIN batch.Node n ON n.Id=j.NodeId
+        WHERE n.RunId=@Run AND j.Kind='Fetch'
+        """, run), "only the uncommitted fetch page was retried");
+    Console.WriteLine("Passed fetch page rollback and lease recovery.");
 }
 
 async Task CrashRecoveryAsync()
