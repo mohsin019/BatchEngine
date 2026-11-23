@@ -70,7 +70,7 @@ internal sealed partial class Store
             SELECT TOP (2) Id,
                 CASE WHEN DATALENGTH(DefinitionJson) <= 4194304 THEN DefinitionJson END,
                 CASE WHEN DATALENGTH(InputJson) <= 4194304 THEN InputJson END,
-                CONVERT(bit, CASE WHEN GroupKey IS NULL THEN 0 ELSE 1 END)
+                CONVERT(bit, CASE WHEN GroupKey IS NULL THEN 0 ELSE 1 END), SelectedProcessKeysJson
             FROM batch.Submission WITH (READPAST, READCOMMITTEDLOCK)
             WHERE Status = 'Queued' ORDER BY SubmittedAt, Id;
             EXEC batch.Claim @Limit, @WorkerId, @LeaseSeconds;
@@ -84,7 +84,8 @@ internal sealed partial class Store
         await using var data = await command.ExecuteReaderAsync(ct);
         while (await data.ReadAsync(ct))
             queued.Add(new(data.GetGuid(0), data.IsDBNull(1) ? null : data.GetString(1),
-                data.IsDBNull(2) ? null : data.GetString(2), data.GetBoolean(3)));
+                data.IsDBNull(2) ? null : data.GetString(2), data.GetBoolean(3),
+                data.IsDBNull(4) ? null : data.GetString(4)));
 
         if (!await data.NextResultAsync(ct) || !await data.ReadAsync(ct))
             throw new InvalidDataException("SQL Server did not return a claim result");
@@ -101,7 +102,9 @@ internal sealed partial class Store
         await using var connection = await OpenAsync(ct);
         await using var command = new SqlCommand("""
             SELECT c.ConfigurationKey, c.Handler, c.ChildrenMode, c.OptionsJson,
-                c.MaxParallelTasks, c.MaxAttempts, c.TimeoutSeconds
+                c.MaxParallelTasks, c.MaxAttempts, c.TimeoutSeconds, c.TaskExecutionMode, c.TaskTimeoutEnabled,
+                c.TaskTimeoutSeconds, c.ProcessTimeoutEnabled, c.ProcessTimeoutSeconds,
+                c.AllowSameProcessAcrossRuns, c.AllowOtherProcessesAcrossRuns
             FROM batch.ProcessConfiguration c
             JOIN OPENJSON(@Keys) WITH (ConfigurationKey nvarchar(64) '$') k
                 ON c.ConfigurationKey = k.ConfigurationKey COLLATE Latin1_General_100_BIN2;
@@ -110,7 +113,9 @@ internal sealed partial class Store
         await using var data = await command.ExecuteReaderAsync(ct);
         while (await data.ReadAsync(ct))
             configurations.Add(data.GetString(0), new(data.GetString(1), data.GetString(2),
-                data.GetString(3), data.GetInt32(4), data.GetInt32(5), data.GetInt32(6)));
+                data.GetString(3), data.GetInt32(4), data.GetInt32(5), data.GetInt32(6),
+                data.GetString(7), data.GetBoolean(8), data.IsDBNull(9) ? null : data.GetInt32(9),
+                data.GetBoolean(10), data.GetInt32(11), data.GetBoolean(12), data.GetBoolean(13)));
         return configurations;
     }
 
@@ -175,6 +180,7 @@ internal sealed partial class Store
             DECLARE @Overview nvarchar(max) = (
                 SELECT s.Id, s.SubmissionKey, s.GroupKey, s.GroupRevision, s.Status, s.Error,
                     s.SubmittedAt, s.StartedAt, s.FinishedAt,
+                    JSON_QUERY(s.SelectedProcessKeysJson) AS SelectedProcessKeys,
                     JSON_QUERY((
                         SELECT r.TotalTasks, r.ProcessedTasks, r.PendingTasks, r.RunningTasks,
                             r.SucceededTasks, r.InvalidTasks, r.FailedTasks, r.SkippedTasks,
@@ -188,7 +194,8 @@ internal sealed partial class Store
                             COALESCE(progress.SkippedTasks, 0) AS SkippedTasks,
                             COALESCE(progress.ProcessedTasks, 0) AS ProcessedTasks,
                             COALESCE(progress.PendingTasks, 0) AS PendingTasks,
-                            n.MaxParallelTasks, n.TotalRecords, n.RunningRecords, n.SucceededRecords,
+                            n.MaxParallelTasks, n.ConfigurationKey, n.AdmittedAt, n.ProcessDeadlineAt, n.TimedOutAt,
+                            n.TotalRecords, n.RunningRecords, n.SucceededRecords,
                             n.InvalidRecords, n.FailedRecords,
                             COALESCE(progress.SkippedRecords, 0) AS SkippedRecords,
                             COALESCE(progress.ProcessedRecords, 0) AS ProcessedRecords,

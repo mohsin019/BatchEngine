@@ -19,7 +19,11 @@ internal sealed partial class Store
         ReadCatalogPageAsync("""
             SELECT @Json = (
                 SELECT TOP (@Limit) ConfigurationKey AS [key], Handler AS handler, Revision AS revision,
-                    MaxParallelTasks AS maxParallelTasks, UpdatedAt AS updatedAt
+                    MaxParallelTasks AS maxParallelTasks, TaskExecutionMode AS taskExecutionMode,
+                    TaskTimeoutEnabled AS taskTimeoutEnabled, COALESCE(TaskTimeoutSeconds, TimeoutSeconds) AS taskTimeoutSeconds,
+                    ProcessTimeoutEnabled AS processTimeoutEnabled, ProcessTimeoutSeconds AS processTimeoutSeconds,
+                    AllowSameProcessAcrossRuns AS allowSameProcessAcrossRuns,
+                    AllowOtherProcessesAcrossRuns AS allowOtherProcessesAcrossRuns, UpdatedAt AS updatedAt
                 FROM batch.ProcessConfiguration
                 WHERE @AfterKey IS NULL OR ConfigurationKey > @AfterKey
                 ORDER BY ConfigurationKey FOR JSON PATH
@@ -67,7 +71,7 @@ internal sealed partial class Store
     }
 
     internal async Task<Guid> SubmitGroupAsync(string key, long revision, string input, string? submissionKey,
-        CancellationToken ct)
+        string? selectedProcessKeysJson, CancellationToken ct)
     {
         await using var connection = await OpenAsync(ct);
         await using var command = Procedure(connection, "batch.Submit");
@@ -75,6 +79,7 @@ internal sealed partial class Store
         command.Parameters.Add("@GroupRevision", SqlDbType.BigInt).Value = revision;
         AddText(command, "@InputJson", input);
         AddText(command, "@SubmissionKey", submissionKey, 200);
+        AddText(command, "@SelectedProcessKeysJson", selectedProcessKeysJson);
         return (Guid)(await command.ExecuteScalarAsync(ct))!;
     }
 }

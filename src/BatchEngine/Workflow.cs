@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 using BatchEngine.Contracts;
 
@@ -7,11 +8,16 @@ namespace BatchEngine;
 
 internal sealed record PlanNode(
     Guid Id, Guid? ParentId, int Position, string NodeKey, string Kind, string ChildrenMode,
-    string? Handler, string OptionsJson, int MaxParallelTasks, int MaxAttempts, int TimeoutSeconds, int ChildCount, string? GroupHandler);
-internal sealed record QueuedSubmission(Guid Id, string? DefinitionJson, string? InputJson, bool SavedGroup = false);
+    string? Handler, string OptionsJson, int MaxParallelTasks, int MaxAttempts, int TimeoutSeconds, int ChildCount, string? GroupHandler,
+    string? ConfigurationKey, int? ProcessTimeoutSeconds, bool SequentialTasks, bool TaskTimeoutEnabled, int? TaskTimeoutSeconds,
+    bool AllowSameProcessAcrossRuns, bool AllowOtherProcessesAcrossRuns);
+internal sealed record QueuedSubmission(Guid Id, string? DefinitionJson, string? InputJson, bool SavedGroup = false,
+    string? SelectedProcessKeysJson = null);
 internal sealed record Intake(Guid Id, PlanNode[]? Nodes, string? Error);
 internal sealed record ProcessConfiguration(string Handler, string ChildrenMode, string OptionsJson,
-    int MaxParallelTasks, int MaxAttempts, int TimeoutSeconds);
+    int MaxParallelTasks, int MaxAttempts, int TimeoutSeconds, string TaskExecutionMode, bool TaskTimeoutEnabled,
+    int? TaskTimeoutSeconds, bool ProcessTimeoutEnabled, int ProcessTimeoutSeconds,
+    bool AllowSameProcessAcrossRuns, bool AllowOtherProcessesAcrossRuns);
 
 internal static partial class Workflow
 {
@@ -29,7 +35,7 @@ internal static partial class Workflow
         {
             var keys = new HashSet<string>(StringComparer.Ordinal);
             var nodes = new Stack<JsonElement>();
-            nodes.Push(Protocol.Parse(submission.DefinitionJson));
+            nodes.Push(ReadDefinition(submission));
             for (var visited = 0; visited < 1000 && nodes.TryPop(out var node); visited++)
             {
                 if (node.ValueKind != JsonValueKind.Object)
@@ -44,7 +50,7 @@ internal static partial class Workflow
             }
             return keys;
         }
-        catch (Exception exception) when (exception is JsonException or InvalidOperationException)
+        catch (Exception exception) when (exception is JsonException or InvalidOperationException or InvalidDataException)
         {
             // Prepare records the validation error on this submission.
             return [];
@@ -61,7 +67,7 @@ internal static partial class Workflow
                 Encoding.UTF8.GetByteCount(submission.InputJson) > Protocol.SubmissionBytes)
                 throw new InvalidDataException("Definition and input are limited to 2 MiB each");
 
-            var definition = Protocol.Parse(submission.DefinitionJson);
+            var definition = ReadDefinition(submission);
             if (Protocol.Parse(submission.InputJson).ValueKind != JsonValueKind.Object)
                 throw new InvalidDataException("Submission input must be a JSON object");
 
@@ -105,9 +111,10 @@ internal static partial class Workflow
                         throw new InvalidDataException($"{key}: unknown or repeated field {property.Name}");
 
                 ProcessConfiguration? configuration = null;
+                string? configurationKey = null;
                 if (configured)
                 {
-                    var configurationKey = RequiredString(node, "configuration");
+                    configurationKey = RequiredString(node, "configuration");
                     if (!configurations.TryGetValue(configurationKey, out configuration))
                         throw new InvalidDataException($"{key}: unknown process configuration '{configurationKey}'");
                 }
@@ -157,10 +164,15 @@ internal static partial class Workflow
 
                 var item = new PlanNode(Guid.NewGuid(), parent?.Id, position, key,
                     kind == "group" ? "Group" : "Process", mode, handler, optionsJson,
-                    configuration?.MaxParallelTasks ?? Integer(node, "max_parallel_tasks", 1, 256),
+                    configuration?.TaskExecutionMode == "serial" ? 1 :
+                        configuration?.MaxParallelTasks ?? Integer(node, "max_parallel_tasks", 1, 256),
                     configuration?.MaxAttempts ?? Integer(settings, "max_attempts", 3, 20),
                     configuration?.TimeoutSeconds ?? Integer(settings, "timeout_seconds", 60, 86400),
-                    children.Length, groupHandler);
+                    children.Length, groupHandler, configurationKey,
+                    configuration is { ProcessTimeoutEnabled: true } ? configuration.ProcessTimeoutSeconds : null,
+                    configuration?.TaskExecutionMode == "serial",
+                    configuration?.TaskTimeoutEnabled ?? true, configuration?.TaskTimeoutSeconds,
+                    configuration?.AllowSameProcessAcrossRuns ?? true, configuration?.AllowOtherProcessesAcrossRuns ?? true);
                 nodes.Add(item);
 
                 for (var index = 0; index < children.Length; index++)
@@ -170,6 +182,50 @@ internal static partial class Workflow
         catch (Exception exception) when (exception is JsonException or InvalidDataException or InvalidOperationException)
         {
             return new(submission.Id, null, Protocol.Error(exception));
+        }
+    }
+
+    private static JsonElement ReadDefinition(QueuedSubmission submission)
+    {
+        if (submission.SelectedProcessKeysJson is null)
+            return Protocol.Parse(submission.DefinitionJson!);
+
+        var keys = JsonSerializer.Deserialize<string[]>(submission.SelectedProcessKeysJson, Protocol.Json) ?? [];
+        var remaining = keys.ToHashSet(StringComparer.Ordinal);
+        var root = JsonNode.Parse(submission.DefinitionJson!)?.AsObject()
+            ?? throw new InvalidDataException("Expected a saved group definition");
+        Prune(root);
+        if (keys.Length == 0 || remaining.Count != 0)
+            throw new InvalidDataException("Every selected key must identify a process in the saved group");
+        return JsonSerializer.SerializeToElement(root, Protocol.Json);
+
+        void Prune(JsonObject parent)
+        {
+            if (parent["children"] is not JsonArray children)
+                return;
+            var members = children.ToArray();
+            children.Clear();
+            foreach (var member in members)
+            {
+                if (member is not JsonObject node)
+                    throw new InvalidDataException("Invalid member in the saved group");
+                Prune(node);
+                var descendants = node["children"] as JsonArray;
+                if (node["type"]?.GetValue<string>() == "process")
+                {
+                    if (node["key"]?.GetValue<string>() is { } key && remaining.Remove(key))
+                        children.Add(node);
+                    else if (descendants is not null)
+                    {
+                        var promoted = descendants.ToArray();
+                        descendants.Clear();
+                        foreach (var child in promoted)
+                            children.Add(child);
+                    }
+                }
+                else if (descendants is { Count: > 0 })
+                    children.Add(node);
+            }
         }
     }
 

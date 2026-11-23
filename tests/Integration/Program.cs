@@ -19,6 +19,7 @@ var workers = new List<Process>();
 try
 {
     await GroupApiAsync();
+    await SchedulingPoliciesAsync();
     await GroupFailureAsync();
     await FetchRecoveryAsync();
     await ConfiguredVolumesAsync();
@@ -199,7 +200,7 @@ async Task ConfiguredVolumesAsync()
 }
 
 async Task<long> SaveConfigurationAsync(string key, long expectedRevision, int parallelTasks, string options,
-    string handler = "integration.volumes.v1", string childrenMode = "serial")
+    string handler = "integration.volumes.v1", string childrenMode = "serial", Action<SqlParameterCollection>? configure = null)
 {
     await using var connection = new SqlConnection(dsn);
     await connection.OpenAsync();
@@ -211,6 +212,7 @@ async Task<long> SaveConfigurationAsync(string key, long expectedRevision, int p
     command.Parameters.Add("@ExpectedRevision", SqlDbType.BigInt).Value = expectedRevision;
     command.Parameters.Add("@MaxParallelTasks", SqlDbType.Int).Value = parallelTasks;
     command.Parameters.Add("@OptionsJson", SqlDbType.NVarChar, -1).Value = options;
+    configure?.Invoke(command.Parameters);
     return (long)(await command.ExecuteScalarAsync())!;
 }
 
@@ -350,6 +352,30 @@ async Task GroupApiAsync()
                         AND (child.StartedAt < start.FinishedAt OR child.FinishedAt > finish.StartedAt)
                 )
             """, run), "group hooks surround the children of both groups");
+        var partial = new { revision = 3, submissionKey = group + "-partial", processKeys = new[] { "fourth", "third" } };
+        using var partialReply = await client.PostAsJsonAsync($"/api/groups/{group}/runs", partial);
+        if (partialReply.StatusCode != HttpStatusCode.Accepted)
+            throw new InvalidOperationException(await partialReply.Content.ReadAsStringAsync());
+        var partialRun = (await partialReply.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("runId").GetGuid();
+        await ExpectStatusAsync(partialRun, "Success");
+        Equal(2, await QueryAsync<int>("SELECT COUNT(*) FROM batch.Node WHERE RunId=@Run AND Kind='Process'", partialRun),
+            "partial run contains only selected processes");
+        Equal(1, await QueryAsync<int>("""
+            SELECT COUNT(*) FROM batch.Node a JOIN batch.Node b ON a.ParentId=b.ParentId
+            WHERE a.RunId=@Run AND a.NodeKey='third' AND b.NodeKey='fourth' AND a.FinishedAt<=b.StartedAt
+            """, partialRun), "descendants of an omitted parent run in their saved order");
+
+        using var replayPartial = await client.PostAsJsonAsync($"/api/groups/{group}/runs",
+            new { revision = 3, submissionKey = group + "-partial", processKeys = new[] { "third", "fourth" } });
+        Equal(HttpStatusCode.Accepted, replayPartial.StatusCode, "selection is replayed as a set");
+        Equal(partialRun, (await replayPartial.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("runId").GetGuid(),
+            "reordered selection preserves submission identity");
+        using var differentSelection = await client.PostAsJsonAsync($"/api/groups/{group}/runs",
+            new { revision = 3, submissionKey = group + "-partial", processKeys = new[] { "third" } });
+        Equal(HttpStatusCode.Conflict, differentSelection.StatusCode, "a different selection conflicts with a used key");
+        using var unknownSelection = await client.PostAsJsonAsync($"/api/groups/{group}/runs",
+            new { revision = 3, processKeys = new[] { "unknown" } });
+        Equal(HttpStatusCode.BadRequest, unknownSelection.StatusCode, "unknown process selection is rejected");
         Console.WriteLine("Passed group API editing, revision snapshots, sequential processes and group hooks.");
     }
     finally
@@ -367,6 +393,106 @@ async Task GroupApiAsync()
 
     static object Configured(string key, string configuration, params object[] children) =>
         new { key, type = "process", configuration, children };
+}
+
+async Task SchedulingPoliciesAsync()
+{
+    var prefix = $"policy-{Guid.NewGuid():N}";
+    var heldOptions = JsonSerializer.Serialize(new { count = 2, mode = "hold" });
+    var oneTaskOptions = JsonSerializer.Serialize(new { count = 1, mode = "hold" });
+    var same = prefix + "-same";
+    var ordinary = prefix + "-ordinary";
+    var exclusive = prefix + "-exclusive";
+    var deadline = prefix + "-deadline";
+    var attempt = prefix + "-attempt";
+    var sequence = prefix + "-sequence";
+
+    await SaveConfigurationAsync(same, 0, 4, heldOptions, "integration.fixture.v1", configure: p =>
+    {
+        p.Add("@AllowSameProcessAcrossRuns", SqlDbType.Bit).Value = false;
+        p.Add("@TaskExecutionMode", SqlDbType.VarChar, 8).Value = "serial";
+    });
+    await SaveConfigurationAsync(ordinary, 0, 1, oneTaskOptions, "integration.fixture.v1");
+    await SaveConfigurationAsync(exclusive, 0, 1, oneTaskOptions, "integration.fixture.v1", configure: p =>
+        p.Add("@AllowOtherProcessesAcrossRuns", SqlDbType.Bit).Value = false);
+    await SaveConfigurationAsync(deadline, 0, 1, heldOptions, "integration.fixture.v1", configure: p =>
+    {
+        p.Add("@TaskTimeoutEnabled", SqlDbType.Bit).Value = false;
+        p.Add("@TaskTimeoutSeconds", SqlDbType.Int).Value = 1;
+        p.Add("@ProcessTimeoutEnabled", SqlDbType.Bit).Value = true;
+        p.Add("@ProcessTimeoutSeconds", SqlDbType.Int).Value = 3;
+    });
+    await SaveConfigurationAsync(attempt, 0, 1, JsonSerializer.Serialize(new { count = 1, mode = "timeout" }),
+        "integration.fixture.v1", configure: p => p.Add("@TaskTimeoutSeconds", SqlDbType.Int).Value = 1);
+    await SaveConfigurationAsync(sequence, 0, 4, JsonSerializer.Serialize(new { count = 3, mode = "mixed" }),
+        "integration.fixture.v1", configure: p => p.Add("@TaskExecutionMode", SqlDbType.VarChar, 8).Value = "serial");
+
+    var first = await SubmitConfiguredAsync(same);
+    await WaitForTaskAsync(first);
+    var duplicate = await SubmitConfiguredAsync(same);
+    await WaitForAdmissionQueueAsync(duplicate);
+    var unrelated = await SubmitConfiguredAsync(ordinary);
+    await WaitForTaskAsync(unrelated);
+    Equal(1, await QueryAsync<int>("SELECT MaxParallelTasks FROM batch.Node WHERE RunId=@Run AND Kind='Process'", first),
+        "serial mode limits tasks independently of the configured parallel capacity");
+    await ReleaseAsync(first);
+    await ExpectStatusAsync(first, "Success");
+    await WaitForTaskAsync(duplicate);
+    await ReleaseAsync(duplicate);
+    await ExpectStatusAsync(duplicate, "Success");
+
+    var blocking = await SubmitConfiguredAsync(exclusive);
+    await WaitForAdmissionQueueAsync(blocking);
+    await ReleaseAsync(unrelated);
+    await ExpectStatusAsync(unrelated, "Success");
+    await WaitForTaskAsync(blocking);
+    var later = await SubmitConfiguredAsync(ordinary);
+    await WaitForAdmissionQueueAsync(later);
+    await ReleaseAsync(blocking);
+    await ExpectStatusAsync(blocking, "Success");
+    await WaitForTaskAsync(later);
+    await ReleaseAsync(later);
+    await ExpectStatusAsync(later, "Success");
+
+    var bounded = await SubmitConfiguredAsync(deadline);
+    await ExpectStatusAsync(bounded, "Failed");
+    Equal(1, await QueryAsync<int>("""
+        SELECT COUNT(*) FROM batch.Node WHERE RunId=@Run AND Kind='Process' AND TimedOutAt IS NOT NULL
+        """, bounded), "the process deadline is durable");
+    Equal(2, await QueryAsync<int>("SELECT COUNT(*) FROM batch.TaskStatus WHERE RunId=@Run AND Status='Failed'", bounded),
+        "the process deadline fails both running and pending tasks");
+    Equal(1, await QueryAsync<int>("SELECT SUM(Attempts) FROM batch.TaskStatus WHERE RunId=@Run", bounded),
+        "disabled task timeout did not retry the held task before the process deadline");
+
+    var retried = await SubmitConfiguredAsync(attempt);
+    await ExpectStatusAsync(retried, "Success");
+    Equal(2, await QueryAsync<int>("SELECT Attempts FROM batch.TaskStatus WHERE RunId=@Run", retried),
+        "enabled task timeout applied to the first attempt");
+
+    var sequential = await SubmitConfiguredAsync(sequence);
+    await ExpectStatusAsync(sequential, "Invalid");
+    Equal(1, await QueryAsync<int>("""
+        SELECT COUNT(*) FROM batch.TaskStatus a JOIN batch.TaskStatus b ON a.RunId=b.RunId
+        WHERE a.RunId=@Run AND a.RecordKey='1' AND a.Attempts=2 AND b.RecordKey='2'
+            AND a.FinishedAt <= b.StartedAt
+        """, sequential), "serial retry completed before the next fetched task");
+    Console.WriteLine("Passed SQL scheduling policies, serial task retries and independent timeouts.");
+
+    Task<Guid> SubmitConfiguredAsync(string configuration) =>
+        SubmitAsync(Group("root", "serial", new { key = "process", type = "process", configuration }));
+
+    Task WaitForTaskAsync(Guid run) => WaitAsync(async () => await QueryAsync<int>("""
+        SELECT COUNT(*) FROM batch.ProcessProgress WHERE RunId=@Run AND RunningTasks=1
+        """, run) == 1);
+
+    Task WaitForAdmissionQueueAsync(Guid run) => WaitAsync(async () => await QueryAsync<int>("""
+        SELECT COUNT(*) FROM batch.Node WHERE RunId=@Run AND Phase='Start' AND Kind='Process' AND AdmittedAt IS NULL
+        """, run) == 1);
+
+    Task<int> ReleaseAsync(Guid run) => QueryAsync<int>("""
+        INSERT batch.SharedData (RunId, [Key], ValueJson, Version) VALUES (@Run, N'integration.release', N'true', 1);
+        SELECT 1;
+        """, run);
 }
 
 static object GroupLifecycle(bool failStart = false, bool retryFinish = false) =>

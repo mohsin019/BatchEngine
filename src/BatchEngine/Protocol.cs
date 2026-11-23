@@ -47,8 +47,21 @@ internal static class Protocol
 internal sealed record JobLease(
     long Id, Guid RunId, string ProcessKey, string Kind, string Handler, string OptionsJson,
     string? InputJson, string? RecordKey, string? PayloadJson, string? Cursor, int Attempts,
-    Guid LeaseToken, int TimeoutSeconds, string? OwnStatus, long TotalTasks,
-    long SucceededTasks, long InvalidTasks, long FailedTasks, long SkippedTasks, string? ProcessError, string? NodeKind);
+    Guid LeaseToken, int? TimeoutSeconds, string? OwnStatus, long TotalTasks,
+    long SucceededTasks, long InvalidTasks, long FailedTasks, long SkippedTasks, string? ProcessError, string? NodeKind, long? ProcessMillisecondsRemaining)
+{
+    internal TimeSpan? AttemptTimeout
+    {
+        get
+        {
+            long? taskMilliseconds = TimeoutSeconds is { } seconds ? seconds * 1000L : null;
+            var milliseconds = ProcessMillisecondsRemaining is { } remaining
+                ? Math.Min(taskMilliseconds ?? remaining, remaining)
+                : taskMilliseconds;
+            return milliseconds is { } value ? TimeSpan.FromMilliseconds(Math.Max(0, value)) : null;
+        }
+    }
+}
 
 internal sealed record FetchedRecord(string Key, string PayloadJson, int RowCount);
 internal sealed record AttemptResult(

@@ -66,7 +66,14 @@ EXEC batch.SaveProcessConfiguration
     @MaxAttempts = 3,
     @TimeoutSeconds = 60,
     @ChildrenMode = 'serial',
-    @OptionsJson = N'{"rowsPerVolume":100}';
+    @OptionsJson = N'{"rowsPerVolume":100}',
+    @TaskExecutionMode = 'parallel',
+    @TaskTimeoutEnabled = 1,
+    @TaskTimeoutSeconds = 30,
+    @ProcessTimeoutEnabled = 1,
+    @ProcessTimeoutSeconds = 900,
+    @AllowSameProcessAcrossRuns = 0,
+    @AllowOtherProcessesAcrossRuns = 1;
 
 SELECT * FROM batch.ProcessConfiguration WHERE ConfigurationKey = N'orders-audit';
 ~~~
@@ -86,6 +93,17 @@ Reference the configuration in a workflow after deploying the named handler to a
 ~~~
 
 Use key, type, configuration and optional children on a configured process node. The worker reads the referenced settings when it accepts a queued workflow and persists them in its execution plan. Edits apply to workflows accepted after the save. A parallel-task limit of one runs tasks serially, and a larger limit allows that many concurrent task leases across the worker cluster for the process instance.
+
+| Configuration setting | Execution behavior |
+| --- | --- |
+| MaxParallelTasks | Cluster-wide task limit for one process instance in parallel mode. |
+| TaskExecutionMode | parallel uses the task limit. serial runs volumes in fetch order, completing a retry before starting the next volume. |
+| TaskTimeoutEnabled and TaskTimeoutSeconds | Per-attempt deadline for a task. The duration inherits TimeoutSeconds until set explicitly. |
+| ProcessTimeoutEnabled and ProcessTimeoutSeconds | Total deadline for start, fetch, tasks and their retries, measured from the first admitted start. TimeoutSeconds still controls individual lifecycle hook attempts, including after-process cleanup. |
+| AllowSameProcessAcrossRuns | Set to zero to serialize instances of this configuration across separate submissions. |
+| AllowOtherProcessesAcrossRuns | Set to zero for exclusive process execution across runs. The process waits for existing work in other runs to finish. New processes in those runs wait until it completes its own work and finish hook. |
+
+Existing configurations default to parallel task mode, an enabled task timeout inherited from TimeoutSeconds, a disabled process deadline and both overlap policies enabled. A process deadline expires outstanding work and schedules the after-process hook with a Failed outcome. TaskStatus marks unfinished released tasks Failed and staged tasks Skipped. Run init-db and update all workers and the API before using these settings.
 
 ## Group management API
 
@@ -129,10 +147,12 @@ The two lists accept limit from 1 to 100 and afterKey for paging by key. A group
 Submit the group by key with its revision, a submissionKey for safe retries, and optional input. For example, send the following to POST /api/groups/daily-order-audit/runs after saving that group at revision 1.
 
 ~~~json
-{"revision":1,"submissionKey":"daily-order-audit-request-1","input":{"region":"north"}}
+{"revision":1,"submissionKey":"daily-order-audit-request-1","processKeys":["orders"],"input":{"region":"north"}}
 ~~~
 
-A stale group revision returns HTTP 409. Repeating a submission with the same key, group revision and input returns the original run ID. SQL Server stores the group definition snapshot on submission. Workers accept that snapshot from the queue and execute its processes one at a time in tree order. Each process still uses its own parallel task limit across workers. Independent runs can execute concurrently.
+Use processKeys to submit a nonempty selection of process node keys. Omitting it submits the full group. The saved tree determines execution order. When a process is omitted, selected descendants are promoted to the nearest retained parent. Groups with selected descendants keep their lifecycle hooks.
+
+A stale group revision returns HTTP 409. Repeating a submission with the same key, group revision, process selection and input returns the original run ID. SQL Server stores the group definition snapshot on submission. Workers accept that snapshot from the queue and execute its processes one at a time in tree order. Each process still uses its own parallel task limit across workers. The process overlap settings control whether processes in separate runs can execute concurrently.
 
 ## Group lifecycle hooks
 
@@ -232,7 +252,7 @@ The engine batches claims, renewals, and settlements, uses filtered queue indexe
 
 ## Verification
 
-The integration executable starts two independent workers, loads a separate business plugin assembly, and submits work both directly to SQL Server and through the group API. It checks hierarchy editing and snapshots, group hooks, fetch rollback and recovery, editable process configurations, parallel result-set volumes, live task and record counts, tree order, cross-worker task execution, staged fetches, both business outcomes, retries, task hooks, permanent failures, hard timeouts and recovery after a worker crash.
+The integration executable starts two independent workers, loads a separate business plugin assembly, and submits work both directly to SQL Server and through the group API. It checks selected-process hierarchy, cross-run scheduling and timeouts, hierarchy editing and snapshots, group hooks, fetch rollback and recovery, editable process configurations, parallel result-set volumes, live task and record counts, tree order, cross-worker task execution, staged fetches, both business outcomes, retries, task hooks, permanent failures, hard timeouts and recovery after a worker crash.
 
 ~~~sh
 export BATCH_TEST_SQL_CONNECTION='<disposable-sql-server-database-connection-string>'

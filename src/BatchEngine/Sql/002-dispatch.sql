@@ -4,26 +4,56 @@ AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
-    DECLARE @RunId uniqueidentifier, @Resource nvarchar(255), @LockResult int, @Payload nvarchar(max);
+    DECLARE @RunId uniqueidentifier, @Resource nvarchar(255), @LockResult int, @Payload nvarchar(max), @NextProcess uniqueidentifier;
     DECLARE @Locked table(RunId uniqueidentifier PRIMARY KEY);
     DECLARE @Candidates table(Id bigint PRIMARY KEY);
     DECLARE @Claimed table(Id bigint PRIMARY KEY, NodeId uniqueidentifier, Kind varchar(8), [RowCount] int);
 
-    -- Look for ready work before taking any locks. Re-read after taking each run lock.
+    DECLARE @EligibleAdmissions table(NodeId uniqueidentifier PRIMARY KEY);
+    BEGIN TRANSACTION;
+
+    -- Admission checks and the first claim are atomic across all workers.
+    EXEC @LockResult = sys.sp_getapplock
+        @Resource = N'batch.process-admission', @LockMode = 'Exclusive',
+        @LockOwner = 'Transaction', @LockTimeout = 0;
+    -- Already admitted processes can continue claiming work while another worker admits a new process.
+    IF @LockResult >= 0
+        INSERT @EligibleAdmissions
+        SELECT n.Id FROM batch.Node n WITH (READPAST, READCOMMITTEDLOCK)
+        JOIN batch.Job j WITH (READPAST, READCOMMITTEDLOCK) ON j.NodeId = n.Id
+        WHERE n.Kind = 'Process' AND n.Phase = 'Start' AND n.AdmittedAt IS NULL
+            AND j.Kind = 'Start' AND j.Status = 'Ready' AND j.AvailableAt <= SYSUTCDATETIME()
+            AND NOT EXISTS (
+                SELECT 1 FROM batch.Node active
+                WHERE active.AdmittedAt IS NOT NULL AND active.Phase IN ('Start', 'Fetch', 'Task', 'Finish')
+                    AND active.RunId <> n.RunId
+                    AND (active.AllowOtherProcessesAcrossRuns = 0 OR n.AllowOtherProcessesAcrossRuns = 0
+                        OR (active.ConfigurationKey = n.ConfigurationKey
+                            AND (active.AllowSameProcessAcrossRuns = 0 OR n.AllowSameProcessAcrossRuns = 0)))
+            );
+
+    -- A waiting process cannot displace an already admitted process that must finish first.
     DECLARE runs CURSOR LOCAL FAST_FORWARD FOR
         SELECT TOP (@Limit * 2) s.Id FROM batch.Submission s WITH (READPAST, READCOMMITTEDLOCK)
         WHERE s.Status = 'Running' AND EXISTS (
             SELECT 1 FROM batch.Node n WITH (READPAST, READCOMMITTEDLOCK)
             WHERE n.RunId = s.Id AND n.Phase IN ('Start', 'Fetch', 'Task', 'Finish')
+                AND (n.Phase = 'Finish' OR n.ProcessDeadlineAt IS NULL OR n.ProcessDeadlineAt > SYSUTCDATETIME())
+                AND (n.Kind = 'Group' OR n.AdmittedAt IS NOT NULL
+                    OR EXISTS (SELECT 1 FROM @EligibleAdmissions e WHERE e.NodeId = n.Id))
                 AND n.RunningTasks < n.MaxParallelTasks AND EXISTS (
                     SELECT 1 FROM batch.Job j WITH (READPAST, READCOMMITTEDLOCK)
                     WHERE j.NodeId = n.Id AND j.Kind = n.Phase AND j.Status = 'Ready'
                         AND j.AvailableAt <= SYSUTCDATETIME()
+                        AND (n.SequentialTasks = 0 OR j.Kind <> 'Task' OR j.Id = (
+                            SELECT TOP (1) firstTask.Id FROM batch.Job firstTask
+                            WHERE firstTask.NodeId = n.Id AND firstTask.Kind = 'Task' AND firstTask.Status = 'Ready'
+                            ORDER BY firstTask.Id
+                        ))
                 )
         )
         ORDER BY s.SubmittedAt, s.Id;
 
-    BEGIN TRANSACTION;
     OPEN runs;
     FETCH NEXT FROM runs INTO @RunId;
     WHILE @@FETCH_STATUS = 0
@@ -39,6 +69,13 @@ BEGIN
 
     IF EXISTS (SELECT 1 FROM @Locked)
     BEGIN
+        -- Claim at most one initial process per batch so candidates cannot conflict with each other.
+        SELECT TOP (1) @NextProcess = n.Id
+        FROM @EligibleAdmissions e JOIN batch.Node n ON n.Id = e.NodeId
+        JOIN @Locked l ON l.RunId = n.RunId JOIN batch.Submission s ON s.Id = n.RunId
+        WHERE n.Phase = 'Start' AND n.AdmittedAt IS NULL
+        ORDER BY s.SubmittedAt, n.StartedAt, n.Id;
+
         INSERT @Candidates (Id)
         SELECT TOP (@Limit) q.Id
         FROM @Locked l JOIN batch.Node n ON n.RunId = l.RunId
@@ -49,9 +86,16 @@ BEGIN
             FROM batch.Job j
             WHERE j.NodeId = n.Id AND j.Kind = n.Phase AND j.Status = 'Ready'
                 AND j.AvailableAt <= SYSUTCDATETIME()
+                AND (n.SequentialTasks = 0 OR j.Kind <> 'Task' OR j.Id = (
+                    SELECT TOP (1) firstTask.Id FROM batch.Job firstTask
+                    WHERE firstTask.NodeId = n.Id AND firstTask.Kind = 'Task' AND firstTask.Status = 'Ready'
+                    ORDER BY firstTask.Id
+                ))
             ORDER BY j.AvailableAt, j.Id
         ) q
         WHERE n.Phase IN ('Start', 'Fetch', 'Task', 'Finish')
+            AND (n.Phase = 'Finish' OR n.ProcessDeadlineAt IS NULL OR n.ProcessDeadlineAt > SYSUTCDATETIME())
+            AND (n.Kind = 'Group' OR n.AdmittedAt IS NOT NULL OR n.Id = @NextProcess)
         ORDER BY q.QueuePosition, q.AvailableAt, q.Id;
 
         UPDATE j SET Status = 'Running', Attempts = Attempts + 1, WorkerId = @WorkerId,
@@ -59,6 +103,11 @@ BEGIN
             StartedAt = COALESCE(StartedAt, SYSUTCDATETIME())
         OUTPUT inserted.Id, inserted.NodeId, inserted.Kind, inserted.[RowCount] INTO @Claimed
         FROM batch.Job j JOIN @Candidates c ON j.Id = c.Id;
+
+        UPDATE n SET AdmittedAt = SYSUTCDATETIME(),
+            ProcessDeadlineAt = DATEADD(second, n.ProcessTimeoutSeconds, SYSUTCDATETIME())
+        FROM batch.Node n JOIN @Claimed c ON c.NodeId = n.Id
+        WHERE n.Id = @NextProcess AND c.Kind = 'Start';
 
         UPDATE n SET RunningTasks = RunningTasks + c.Amount, RunningRecords = RunningRecords + c.Records
         FROM batch.Node n JOIN (
@@ -71,7 +120,13 @@ BEGIN
         SELECT j.Id, n.RunId, n.NodeKey AS ProcessKey, j.Kind, n.Kind AS NodeKind,
             COALESCE(n.Handler, n.GroupHandler) AS Handler, n.OptionsJson,
             CASE WHEN j.Kind <> 'Task' THEN s.InputJson END AS InputJson,
-            j.RecordKey, j.PayloadJson, j.CursorValue AS [Cursor], j.Attempts, j.LeaseToken, n.TimeoutSeconds,
+            j.RecordKey, j.PayloadJson, j.CursorValue AS [Cursor], j.Attempts, j.LeaseToken,
+            CASE WHEN j.Kind <> 'Task' THEN n.TimeoutSeconds
+                 WHEN n.TaskTimeoutEnabled = 1 THEN COALESCE(n.TaskTimeoutSeconds, n.TimeoutSeconds)
+            END AS TimeoutSeconds,
+            CASE WHEN j.Kind <> 'Finish'
+                 THEN DATEDIFF_BIG(millisecond, SYSUTCDATETIME(), n.ProcessDeadlineAt)
+            END AS ProcessMillisecondsRemaining,
             CASE WHEN n.Kind = 'Group' AND j.Kind = 'Finish' THEN batch.MergeStatus(n.OwnStatus, n.ChildrenStatus)
                  ELSE n.OwnStatus END AS OwnStatus,
             n.TotalTasks, n.SucceededTasks, n.InvalidTasks, n.FailedTasks,
@@ -94,7 +149,10 @@ BEGIN
     UPDATE j SET LeaseUntil = DATEADD(second, @LeaseSeconds, SYSUTCDATETIME())
     OUTPUT inserted.Id
     FROM batch.Job j JOIN OPENJSON(@Claims) WITH (Id bigint, Token uniqueidentifier) c ON j.Id = c.Id
-    WHERE j.LeaseToken = c.Token AND j.Status = 'Running' AND j.LeaseUntil > SYSUTCDATETIME();
+    JOIN batch.Node n ON n.Id = j.NodeId
+    WHERE j.LeaseToken = c.Token AND j.Status = 'Running' AND j.LeaseUntil > SYSUTCDATETIME()
+        AND j.Kind = n.Phase
+        AND (j.Kind = 'Finish' OR n.ProcessDeadlineAt IS NULL OR n.ProcessDeadlineAt > SYSUTCDATETIME());
 END;
 GO
 
@@ -125,7 +183,8 @@ BEGIN
     SELECT @NodeId = j.NodeId, @Kind = j.Kind, @NodeKind = n.Kind,
         @Attempts = j.Attempts, @MaxAttempts = n.MaxAttempts
     FROM batch.Job j WITH (UPDLOCK) JOIN batch.Node n ON n.Id = j.NodeId
-    WHERE j.Id = @Id AND j.LeaseToken = @Token AND j.Status = 'Running'
+    WHERE j.Id = @Id AND j.LeaseToken = @Token AND j.Status = 'Running' AND j.Kind = n.Phase
+        AND (j.Kind = 'Finish' OR n.ProcessDeadlineAt IS NULL OR n.ProcessDeadlineAt > SYSUTCDATETIME())
         AND ((@Expired = 1 AND j.LeaseUntil <= SYSUTCDATETIME()) OR
              (@Expired = 0 AND j.LeaseUntil > SYSUTCDATETIME()));
     IF @NodeId IS NULL RETURN;
@@ -154,7 +213,8 @@ BEGIN
     BEGIN
         DECLARE @Staged table ([RowCount] int NOT NULL);
         ;WITH PageRecords AS (
-            SELECT r.RecordKey, r.PayloadJson, COALESCE(r.[RowCount], 1) AS [RowCount], ROW_NUMBER() OVER (
+            SELECT r.RecordKey, r.PayloadJson, COALESCE(r.[RowCount], 1) AS [RowCount],
+                CONVERT(int, entries.[key]) AS Position, ROW_NUMBER() OVER (
                 PARTITION BY r.RecordKey COLLATE Latin1_General_100_BIN2 ORDER BY CONVERT(int, entries.[key])
             ) AS RowNumber
             FROM OPENJSON(@Records) entries
@@ -167,7 +227,8 @@ BEGIN
         FROM PageRecords r WHERE r.RowNumber = 1 AND NOT EXISTS (
             SELECT 1 FROM batch.Job j
             WHERE j.NodeId = @NodeId AND j.Kind = 'Task' AND j.RecordKey = r.RecordKey COLLATE Latin1_General_100_BIN2
-        );
+        )
+        ORDER BY r.Position;
         UPDATE batch.Node SET TotalTasks = TotalTasks + staged.Tasks, TotalRecords = TotalRecords + staged.Records
         FROM (SELECT COUNT(*) AS Tasks, COALESCE(SUM(CONVERT(bigint, [RowCount])), 0) AS Records FROM @Staged) staged
         WHERE Id = @NodeId;
@@ -270,7 +331,8 @@ BEGIN
     JOIN batch.Node n ON n.Id = j.NodeId
     CROSS APPLY (VALUES (CASE WHEN r.Status = 'Failed' AND r.Retryable = 1 AND j.Attempts < n.MaxAttempts
         THEN 1 ELSE 0 END)) retry(ShouldRetry)
-    WHERE j.Kind = 'Task' AND j.Status = 'Running' AND j.LeaseToken = r.Token AND (
+    WHERE j.Kind = 'Task' AND n.Phase = 'Task' AND j.Status = 'Running' AND j.LeaseToken = r.Token
+        AND (n.ProcessDeadlineAt IS NULL OR n.ProcessDeadlineAt > SYSUTCDATETIME()) AND (
         (@Expired = 1 AND j.LeaseUntil <= SYSUTCDATETIME()) OR
         (@Expired = 0 AND j.LeaseUntil > SYSUTCDATETIME()));
 
@@ -330,10 +392,58 @@ BEGIN
 END;
 GO
 
+CREATE OR ALTER PROCEDURE batch.ExpireProcesses @Limit int
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    DECLARE @NodeId uniqueidentifier, @RunId uniqueidentifier, @Resource nvarchar(255), @LockResult int;
+    DECLARE deadlines CURSOR LOCAL FAST_FORWARD FOR
+        SELECT TOP (@Limit) Id, RunId FROM batch.Node WITH (READPAST, READCOMMITTEDLOCK)
+        WHERE ProcessDeadlineAt <= SYSUTCDATETIME() AND Phase IN ('Start', 'Fetch', 'Task')
+        ORDER BY ProcessDeadlineAt, Id;
+
+    OPEN deadlines;
+    FETCH NEXT FROM deadlines INTO @NodeId, @RunId;
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        BEGIN TRANSACTION;
+        SET @Resource = CONCAT(N'batch.run.', CONVERT(nvarchar(36), @RunId));
+        EXEC @LockResult = sys.sp_getapplock @Resource = @Resource, @LockMode = 'Exclusive',
+            @LockOwner = 'Transaction', @LockTimeout = 0;
+        IF @LockResult >= 0 AND EXISTS (
+            SELECT 1 FROM batch.Node WHERE Id = @NodeId
+                AND ProcessDeadlineAt <= SYSUTCDATETIME() AND Phase IN ('Start', 'Fetch', 'Task')
+        )
+        BEGIN
+            DECLARE @Now datetime2(3) = SYSUTCDATETIME();
+            UPDATE batch.Job SET Status = 'Failed', LeaseToken = NULL, LeaseUntil = NULL,
+                Error = N'Process execution timed out', FinishedAt = @Now
+            WHERE NodeId = @NodeId AND Status = 'Running';
+
+            UPDATE batch.Job SET Status = 'Failed', Error = N'Process execution timed out', FinishedAt = @Now
+            WHERE NodeId = @NodeId AND Kind IN ('Start', 'Fetch') AND Status = 'Ready';
+
+            -- Close queued task volumes logically, avoiding a write to every staged row.
+            UPDATE batch.Node SET TimedOutAt = @Now, RunningTasks = 0, RunningRecords = 0,
+                FailedTasks = CASE WHEN TasksReleased = 1 THEN TotalTasks - SucceededTasks - InvalidTasks ELSE FailedTasks END,
+                FailedRecords = CASE WHEN TasksReleased = 1 THEN TotalRecords - SucceededRecords - InvalidRecords ELSE FailedRecords END
+            WHERE Id = @NodeId;
+            EXEC batch.BeginFinish @NodeId, 'Failed', N'Process execution timed out';
+        END;
+        COMMIT TRANSACTION;
+        FETCH NEXT FROM deadlines INTO @NodeId, @RunId;
+    END;
+    CLOSE deadlines;
+    DEALLOCATE deadlines;
+END;
+GO
+
 CREATE OR ALTER PROCEDURE batch.Reap @Limit int
 AS
 BEGIN
     SET NOCOUNT ON;
+    EXEC batch.ExpireProcesses @Limit;
     DECLARE @Expired nvarchar(max) = (
         SELECT TOP (@Limit) Id, LeaseToken AS Token,
             'Failed' AS Status, CONVERT(bit, 1) AS Retryable, N'Worker lease expired' AS Error

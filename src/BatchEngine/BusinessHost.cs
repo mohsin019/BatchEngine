@@ -44,7 +44,7 @@ internal static partial class BusinessHost
         RunnerRequest request, PluginRegistry plugins, ISharedData shared)
     {
         var job = request.Job;
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(job.TimeoutSeconds));
+        using var timeout = new CancellationTokenSource(job.AttemptTimeout ?? Timeout.InfiniteTimeSpan);
         var ct = timeout.Token;
         try
         {

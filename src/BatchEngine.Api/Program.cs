@@ -39,6 +39,10 @@ app.Use(async (context, next) =>
     {
         await Results.Problem(detail: ex.Message, statusCode: StatusCodes.Status400BadRequest).ExecuteAsync(context);
     }
+    catch (SqlException ex) when (ex.Number == 51021)
+    {
+        await Results.Problem(detail: ex.Message, statusCode: StatusCodes.Status400BadRequest).ExecuteAsync(context);
+    }
     catch (SqlException ex) when (ex.Number is >= 51017 and <= 51020)
     {
         var status = ex.Number == 51018 ? StatusCodes.Status404NotFound : StatusCodes.Status409Conflict;
@@ -99,7 +103,15 @@ api.MapPost("/groups/{key}/runs", async (string key, SubmitGroupRequest request,
     var inputJson = input.ValueKind == JsonValueKind.Undefined ? "{}" :
         Protocol.Value(input, "Submission input", Protocol.SubmissionBytes);
 
-    var id = await store.SubmitGroupAsync(key, request.Revision.Value, inputJson, request.SubmissionKey, ct);
+    string? selection = null;
+    if (request.ProcessKeys is { } keys)
+    {
+        if (keys.Length is 0 or > 1000 || keys.Any(key => key is null || !Workflow.IsNodeKey(key)) ||
+            keys.Distinct(StringComparer.Ordinal).Count() != keys.Length)
+            throw new InvalidDataException("Provide 1–1,000 distinct process keys.");
+        selection = JsonSerializer.Serialize(keys.Order(StringComparer.Ordinal), Protocol.Json);
+    }
+    var id = await store.SubmitGroupAsync(key, request.Revision.Value, inputJson, request.SubmissionKey, selection, ct);
     return Results.Accepted($"/api/runs/{id}", new { runId = id });
 });
 
@@ -137,4 +149,4 @@ static int PageSize(int? limit) => (limit ?? 100) switch
 };
 
 internal sealed record SaveGroupRequest(string? DisplayName, long? ExpectedRevision, JsonElement Children, JsonElement Lifecycle);
-internal sealed record SubmitGroupRequest(long? Revision, string? SubmissionKey, JsonElement Input);
+internal sealed record SubmitGroupRequest(long? Revision, string? SubmissionKey, JsonElement Input, string[]? ProcessKeys);

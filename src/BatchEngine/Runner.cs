@@ -12,7 +12,8 @@ internal sealed class Runner(Store store, string workerId, int pageSize) : IAsyn
     internal async Task<AttemptResult> RunAsync(JobLease job, CancellationToken ct)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeout.CancelAfter(TimeSpan.FromSeconds(job.TimeoutSeconds));
+        if (job.AttemptTimeout is { } limit)
+            timeout.CancelAfter(limit);
         var deadline = timeout.Token;
         try
         {
@@ -46,7 +47,7 @@ internal sealed class Runner(Store store, string workerId, int pageSize) : IAsyn
         catch (OperationCanceledException) when (deadline.IsCancellationRequested)
         {
             await StopAsync();
-            return AttemptResult.Failure($"Attempt timed out after {job.TimeoutSeconds} seconds");
+            return AttemptResult.Failure("Attempt timed out");
         }
         catch (Exception ex)
         {

@@ -68,6 +68,47 @@ IF COL_LENGTH('batch.Node', 'GroupHandler') IS NULL
         CONSTRAINT CK_BatchNode_GroupHandler CHECK (GroupHandler IS NULL OR Kind = 'Group');
 GO
 
+IF COL_LENGTH('batch.Node', 'AdmittedAt') IS NULL
+BEGIN
+    ALTER TABLE batch.Node ADD
+        ConfigurationKey nvarchar(64) COLLATE Latin1_General_100_BIN2 NULL,
+        AdmittedAt datetime2(3) NULL,
+        ProcessTimeoutSeconds int NULL,
+        ProcessDeadlineAt datetime2(3) NULL,
+        TimedOutAt datetime2(3) NULL,
+        SequentialTasks bit NOT NULL DEFAULT 0,
+        TaskTimeoutEnabled bit NOT NULL DEFAULT 1,
+        TaskTimeoutSeconds int NULL,
+        AllowSameProcessAcrossRuns bit NOT NULL DEFAULT 1,
+        AllowOtherProcessesAcrossRuns bit NOT NULL DEFAULT 1;
+
+    EXEC(N'UPDATE batch.Node SET AdmittedAt = StartedAt
+        WHERE Kind = ''Process'' AND Phase IN (''Start'', ''Fetch'', ''Task'', ''Finish'');
+
+        ;WITH Tree AS (
+            SELECT Id AS RunId, DefinitionJson AS NodeJson FROM batch.Submission WHERE Status = ''Running''
+            UNION ALL
+            SELECT t.RunId, child.value FROM Tree t CROSS APPLY OPENJSON(t.NodeJson, ''$.children'') child
+            WHERE child.type = 5
+        )
+        UPDATE n SET ConfigurationKey = JSON_VALUE(t.NodeJson, ''$.configuration'')
+        FROM batch.Node n JOIN Tree t ON t.RunId = n.RunId
+            AND JSON_VALUE(t.NodeJson, ''$.key'') COLLATE Latin1_General_100_BIN2 = n.NodeKey
+        WHERE n.Kind = ''Process'' AND n.Phase <> ''Done''
+            AND DATALENGTH(JSON_VALUE(t.NodeJson, ''$.configuration'')) <= 128
+        OPTION (MAXRECURSION 64);');
+END;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID('batch.Node') AND name = 'IX_BatchNode_Admitted')
+    CREATE INDEX IX_BatchNode_Admitted ON batch.Node(RunId, Id)
+        INCLUDE (ConfigurationKey, AllowSameProcessAcrossRuns, AllowOtherProcessesAcrossRuns)
+        WHERE AdmittedAt IS NOT NULL AND Phase IN ('Start', 'Fetch', 'Task', 'Finish');
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID('batch.Node') AND name = 'IX_BatchNode_Deadline')
+    CREATE INDEX IX_BatchNode_Deadline ON batch.Node(ProcessDeadlineAt, RunId, Id)
+        WHERE ProcessDeadlineAt IS NOT NULL AND Phase IN ('Start', 'Fetch', 'Task');
+GO
+
 IF OBJECT_ID('batch.Job', 'U') IS NULL
 BEGIN
     CREATE TABLE batch.Job (
@@ -97,6 +138,15 @@ BEGIN
     CREATE INDEX IX_BatchJob_Ready ON batch.Job(NodeId, Kind, AvailableAt, Id) WHERE Status = 'Ready';
     CREATE INDEX IX_BatchJob_Lease ON batch.Job(LeaseUntil, Id) INCLUDE (LeaseToken) WHERE Status = 'Running';
 END;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID('batch.Job') AND name = 'IX_BatchJob_RunningNode')
+    CREATE INDEX IX_BatchJob_RunningNode ON batch.Job (NodeId, Id) WHERE Status = 'Running';
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID('batch.Job') AND name = 'IX_BatchJob_ReadyOrder')
+    CREATE INDEX IX_BatchJob_ReadyOrder ON batch.Job (NodeId, Id)
+        WHERE Status = 'Ready' AND Kind = 'Task';
 GO
 
 IF OBJECT_ID('batch.FetchCursor', 'U') IS NULL
@@ -141,10 +191,17 @@ GO
 
 CREATE OR ALTER VIEW batch.TaskStatus AS
 SELECT n.RunId, n.NodeKey AS ProcessKey, j.Id, j.RecordKey,
-    CASE WHEN n.TasksReleased = 1 THEN j.Status
+    CASE WHEN n.TasksReleased = 1 AND n.TimedOutAt IS NOT NULL AND j.Status IN ('Ready', 'Running') THEN 'Failed'
+         WHEN n.TasksReleased = 1 THEN j.Status
          WHEN n.OwnStatus IS NULL THEN 'Staged'
          ELSE 'Skipped' END AS Status,
-    j.Attempts, j.WorkerId, j.OutputJson, j.Error, j.StartedAt, j.FinishedAt, j.[RowCount]
+    j.Attempts, j.WorkerId, j.OutputJson,
+    CASE WHEN n.TasksReleased = 1 AND n.TimedOutAt IS NOT NULL AND j.Status IN ('Ready', 'Running')
+        THEN N'Process execution timed out' ELSE j.Error END AS Error,
+    j.StartedAt,
+    CASE WHEN n.TasksReleased = 1 AND n.TimedOutAt IS NOT NULL AND j.Status IN ('Ready', 'Running')
+        THEN n.TimedOutAt ELSE j.FinishedAt END AS FinishedAt,
+    j.[RowCount]
 FROM batch.Node n JOIN batch.Job j ON j.NodeId = n.Id
 WHERE j.Kind = 'Task';
 GO
@@ -286,13 +343,18 @@ BEGIN
         IF @@ROWCOUNT = 1 AND @Error IS NULL
         BEGIN
             INSERT batch.Node (Id, RunId, ParentId, Position, NodeKey, Kind, ChildrenMode,
-                Handler, OptionsJson, MaxParallelTasks, MaxAttempts, TimeoutSeconds, RemainingChildren, GroupHandler)
+                Handler, OptionsJson, MaxParallelTasks, MaxAttempts, TimeoutSeconds, RemainingChildren, GroupHandler,
+                ConfigurationKey, ProcessTimeoutSeconds, SequentialTasks, TaskTimeoutEnabled, TaskTimeoutSeconds,
+                AllowSameProcessAcrossRuns, AllowOtherProcessesAcrossRuns)
             SELECT Id, @Id, ParentId, Position, NodeKey, Kind, ChildrenMode, Handler,
-                OptionsJson, MaxParallelTasks, MaxAttempts, TimeoutSeconds, ChildCount, GroupHandler
+                OptionsJson, MaxParallelTasks, MaxAttempts, TimeoutSeconds, ChildCount, GroupHandler,
+                ConfigurationKey, ProcessTimeoutSeconds, COALESCE(SequentialTasks, 0), COALESCE(TaskTimeoutEnabled, 1), TaskTimeoutSeconds,
+                COALESCE(AllowSameProcessAcrossRuns, 1), COALESCE(AllowOtherProcessesAcrossRuns, 1)
             FROM OPENJSON(@Nodes) WITH (Id uniqueidentifier, ParentId uniqueidentifier, Position int,
                 NodeKey nvarchar(64), Kind varchar(8), ChildrenMode varchar(8), Handler nvarchar(128),
                 OptionsJson nvarchar(max), MaxParallelTasks int, MaxAttempts int, TimeoutSeconds int, ChildCount int,
-                GroupHandler nvarchar(128));
+                GroupHandler nvarchar(128), ConfigurationKey nvarchar(64), ProcessTimeoutSeconds int,
+                SequentialTasks bit, TaskTimeoutEnabled bit, TaskTimeoutSeconds int, AllowSameProcessAcrossRuns bit, AllowOtherProcessesAcrossRuns bit);
             SELECT @Root = Id FROM batch.Node WHERE RunId = @Id AND ParentId IS NULL;
             EXEC batch.MoveTree @Root, 'S';
         END;

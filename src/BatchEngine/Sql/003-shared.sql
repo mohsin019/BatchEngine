@@ -11,7 +11,8 @@ BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM batch.Job j WITH (UPDLOCK, HOLDLOCK) JOIN batch.Node n ON n.Id = j.NodeId
         WHERE j.Id = @JobId AND j.Status = 'Running' AND j.LeaseToken = @Token
-            AND j.LeaseUntil > SYSUTCDATETIME() AND n.RunId = @RunId
+            AND j.LeaseUntil > SYSUTCDATETIME() AND n.RunId = @RunId AND j.Kind = n.Phase
+            AND (j.Kind = 'Finish' OR n.ProcessDeadlineAt IS NULL OR n.ProcessDeadlineAt > SYSUTCDATETIME())
     )
         SET @Reply = N'{"Error":"This attempt no longer owns its lease"}';
     ELSE IF @Operation = 'get'
