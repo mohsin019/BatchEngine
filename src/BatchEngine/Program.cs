@@ -1,12 +1,13 @@
-using System.Runtime.InteropServices;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using System.Text.Json;
 using BatchEngine;
 
 try
 {
-    if (args is ["business-host", var parent] && int.TryParse(parent, out var parentId))
+    if (args is ["business-host", var parent, var stopPipe] && int.TryParse(parent, out var parentId))
     {
-        await BusinessHost.RunAsync(parentId);
+        await BusinessHost.RunAsync(parentId, stopPipe);
         return 0;
     }
 
@@ -19,6 +20,7 @@ try
               init-db
               worker
               submit <workflow.json> [input.json] [submission-key]
+              resume <run-id>
               status <run-id> [task-limit]
             """);
         return 0;
@@ -31,19 +33,15 @@ try
     {
         var options = WorkerOptions.Load();
         var store = new Store(connection, $"BatchEngine/{options.Id}", options.PoolSize);
-        using var shutdown = new CancellationTokenSource();
-        using var terminate = OperatingSystem.IsWindows() ? null :
-            PosixSignalRegistration.Create(PosixSignal.SIGTERM, context =>
-            {
-                context.Cancel = true;
-                shutdown.Cancel();
-            });
-        Console.CancelKeyPress += (_, e) =>
-        {
-            e.Cancel = true;
-            shutdown.Cancel();
-        };
-        await new Worker(store, new PluginRegistry(), options).RunAsync(shutdown.Token);
+        var builder = Host.CreateApplicationBuilder();
+        builder.Services.AddWindowsService(service => service.ServiceName = "BatchEngine");
+        builder.Services.Configure<HostOptions>(host =>
+            host.ShutdownTimeout = TimeSpan.FromSeconds(options.GraceSeconds + 30));
+        builder.Services.AddSingleton(store);
+        builder.Services.AddSingleton(options);
+        builder.Services.AddHostedService<BatchWorkerService>();
+        using var host = builder.Build();
+        await host.RunAsync();
         return 0;
     }
 
@@ -65,6 +63,13 @@ try
         Console.WriteLine(await cli.SubmitAsync(
             Protocol.Value(Protocol.Parse(definition), "Definition", Protocol.SubmissionBytes),
             Protocol.Value(Protocol.Parse(input), "Input", Protocol.SubmissionBytes), key));
+        return 0;
+    }
+
+    if (args is ["resume", var run] && Guid.TryParse(run, out var resumeId))
+    {
+        await cli.ResumeAsync(resumeId);
+        Console.WriteLine(resumeId);
         return 0;
     }
 

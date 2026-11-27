@@ -9,8 +9,8 @@ RUN dotnet publish src/BatchEngine/BatchEngine.csproj -c Release -o /app --no-re
 
 FROM mcr.microsoft.com/dotnet/runtime:10.0
 WORKDIR /app
-COPY --from=build /app/ .
-COPY examples/ examples/
+COPY --from=build --chown=$APP_UID /app/ .
+COPY --chown=$APP_UID examples/ examples/
 USER $APP_UID
 ENTRYPOINT ["dotnet", "BatchEngine.dll"]
 CMD ["worker"]

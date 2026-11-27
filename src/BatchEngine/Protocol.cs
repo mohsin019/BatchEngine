@@ -68,6 +68,9 @@ internal sealed record AttemptResult(
     string Status, bool Retryable = false, string? OutputJson = null, string? Error = null,
     IReadOnlyList<FetchedRecord>? Records = null, string? NextCursor = null)
 {
+    internal static AttemptResult Abandoned => new("Released");
+    internal static AttemptResult TimedOut => Failure("Attempt timed out", retryable: false);
+
     internal static AttemptResult Failure(string error, bool retryable = true) =>
         new("Failed", retryable, Error: error);
 }

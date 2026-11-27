@@ -149,6 +149,15 @@ internal sealed partial class Store
         await command.ExecuteNonQueryAsync();
     }
 
+    internal async Task ResumeAsync(Guid id, int? expectedResumeCount = null, CancellationToken ct = default)
+    {
+        await using var connection = await OpenAsync(ct);
+        await using var command = Procedure(connection, "batch.Resume");
+        command.Parameters.Add("@RunId", SqlDbType.UniqueIdentifier).Value = id;
+        command.Parameters.Add("@ExpectedResumeCount", SqlDbType.Int).Value = (object?)expectedResumeCount ?? DBNull.Value;
+        await command.ExecuteNonQueryAsync(ct);
+    }
+
     internal async Task ReapAsync()
     {
         await using var connection = await OpenAsync(default);
@@ -179,7 +188,7 @@ internal sealed partial class Store
         await using var command = new SqlCommand("""
             DECLARE @Overview nvarchar(max) = (
                 SELECT s.Id, s.SubmissionKey, s.GroupKey, s.GroupRevision, s.Status, s.Error,
-                    s.SubmittedAt, s.StartedAt, s.FinishedAt,
+                    s.SubmittedAt, s.StartedAt, s.FinishedAt, s.StoppedAt, s.ResumeCount,
                     JSON_QUERY(s.SelectedProcessKeysJson) AS SelectedProcessKeys,
                     JSON_QUERY((
                         SELECT r.TotalTasks, r.ProcessedTasks, r.PendingTasks, r.RunningTasks,

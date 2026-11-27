@@ -56,7 +56,7 @@ public sealed class DatabaseVolumes : IBatchProcess
             throw new IOException("Sample transient volume failure");
 
         var output = JsonSerializer.SerializeToElement(rows.Select(row => row.Id));
-        if (rows.Any(row => row.Amount == 99))
+        if (rows.Any(row => row.Amount == 99) && context.Attempt == 1)
             throw new PermanentProcessException("Sample technical error for this volume");
         return rows.Any(row => row.Amount < 0)
             ? TaskResult.Invalid("Sample rejection for this volume", output)

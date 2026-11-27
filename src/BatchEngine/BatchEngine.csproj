@@ -1,10 +1,11 @@
-<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk.Worker">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../BatchEngine.Contracts/BatchEngine.Contracts.csproj" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.15" />
     <PackageReference Include="Microsoft.Data.SqlClient" Version="7.0.4" />
     <EmbeddedResource Include="Sql/*.sql" />
     <InternalsVisibleTo Include="BatchEngine.Api" />

@@ -70,7 +70,11 @@ internal sealed class Worker(Store store, PluginRegistry plugins, WorkerOptions 
                 if (stopping.IsCancellationRequested)
                 {
                     if (stopAt == long.MaxValue)
+                    {
                         stopAt = now + options.GraceSeconds * 1000L;
+                        foreach (var runner in runners)
+                            runner.RequestStop();
+                    }
                     if (active.Count == 0 || now >= stopAt)
                         break;
                 }
@@ -94,22 +98,7 @@ internal sealed class Worker(Store store, PluginRegistry plugins, WorkerOptions 
                         flushAt = now + 25;
                     if (finished.Length > 0 && (now >= flushAt || finished.Length == active.Count || stopping.IsCancellationRequested))
                     {
-                        var completions = new List<Active>();
-                        var results = new List<Settlement>();
-                        var budget = 8 * 1024 * 1024;
-                        foreach (var item in finished)
-                        {
-                            var result = await item.Task;
-                            var bytes = EstimateResultSize(result);
-                            if (completions.Count > 0 && bytes > budget)
-                                break;
-                            budget -= bytes;
-                            completions.Add(item);
-                            results.Add(new(item.Lease, result));
-                        }
-                        await store.SettleAsync([.. results]);
-                        foreach (var item in completions)
-                            Release(item);
+                        await FlushAsync(finished);
                         flushAt = long.MaxValue;
                         nextPoll = now;
                     }
@@ -124,6 +113,12 @@ internal sealed class Worker(Store store, PluginRegistry plugins, WorkerOptions 
                             nextSweep = now + options.SweepSeconds * 1000L + Random.Shared.Next(250);
                         if (active.Count == 0 && leases.Length > 0)
                             nextRenew = stopwatch.ElapsedMilliseconds + renewEveryMs;
+                        if (stopping.IsCancellationRequested)
+                        {
+                            if (leases.Length > 0)
+                                await store.SettleAsync(leases.Select(lease => new Settlement(lease, AttemptResult.Abandoned)).ToArray());
+                            continue;
+                        }
                         foreach (var lease in leases)
                         {
                             var slot = slots.Dequeue();
@@ -189,10 +184,41 @@ internal sealed class Worker(Store store, PluginRegistry plugins, WorkerOptions 
         }
         finally
         {
-            await Task.WhenAll(active.Values.Select(CancelAsync));
-            foreach (var item in active.Values)
-                item.Cancellation.Dispose();
-            await Task.WhenAll(runners.Select(runner => runner.DisposeAsync().AsTask()));
+            try
+            {
+                await Task.WhenAll(active.Values.Select(CancelAsync));
+                // Preserve completed results and return interrupted leases without charging a business retry.
+                while (active.Count > 0)
+                    await FlushAsync(active.Values.ToArray());
+            }
+            catch (Exception ex) when (ex is SqlException or TimeoutException)
+            {
+                Console.Error.WriteLine($"Shutdown settlement deferred to lease recovery: {Protocol.Error(ex)}");
+            }
+            finally
+            {
+                foreach (var item in active.Values)
+                    item.Cancellation.Dispose();
+                await Task.WhenAll(runners.Select(runner => runner.DisposeAsync().AsTask()));
+            }
+        }
+
+        async Task FlushAsync(Active[] completed)
+        {
+            var results = new List<Settlement>();
+            var budget = 8 * 1024 * 1024;
+            foreach (var item in completed)
+            {
+                var result = item.Task.IsCanceled ? AttemptResult.Abandoned : await item.Task;
+                var bytes = EstimateResultSize(result);
+                if (results.Count > 0 && bytes > budget)
+                    break;
+                budget -= bytes;
+                results.Add(new(item.Lease, result));
+            }
+            await store.SettleAsync([.. results]);
+            foreach (var item in completed.Take(results.Count))
+                Release(item);
         }
 
         void Release(Active item)

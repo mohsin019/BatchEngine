@@ -1,8 +1,11 @@
 using System.Runtime.InteropServices;
+using System.IO.Pipes;
+using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using BatchEngine.Contracts;
+using Microsoft.Data.SqlClient;
 
 namespace BatchEngine;
 
@@ -14,7 +17,7 @@ internal static partial class BusinessHost
     [LibraryImport("libc", EntryPoint = "getppid")]
     private static partial int GetParentPid();
 
-    internal static async Task RunAsync(int parentId)
+    internal static async Task RunAsync(int parentId, string stopPipe)
     {
         if (OperatingSystem.IsLinux())
         {
@@ -26,6 +29,18 @@ internal static partial class BusinessHost
                 return;
         }
 
+        // On platforms without Linux parent-death signals, an abrupt service exit must also stop a blocked plugin.
+        using var parent = OperatingSystem.IsLinux() ? null : Process.GetProcessById(parentId);
+        if (parent is not null)
+        {
+            parent.Exited += (_, _) => Environment.Exit(1);
+            parent.EnableRaisingEvents = true;
+            if (parent.HasExited) return;
+        }
+
+        using var shutdown = new CancellationTokenSource();
+        using var control = new AnonymousPipeClientStream(PipeDirection.In, stopPipe);
+        var stopping = WatchForStopAsync(control, shutdown);
         using var output = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true };
         Console.SetOut(Console.Error);
         var input = Console.In;
@@ -35,19 +50,30 @@ internal static partial class BusinessHost
         {
             var request = JsonSerializer.Deserialize<RunnerRequest>(line, Protocol.Json)
                 ?? throw new InvalidDataException("Missing runner request");
-            var result = await ExecuteAsync(request, registry, shared);
+            var result = await ExecuteAsync(request, registry, shared, shutdown.Token);
             await output.WriteLineAsync(JsonSerializer.Serialize(new RunnerMessage("result", result), Protocol.Json));
         }
+        await stopping;
+    }
+
+    private static async Task WatchForStopAsync(AnonymousPipeClientStream control, CancellationTokenSource shutdown)
+    {
+        // Closing this dedicated pipe signals cancellation even during a blocking business call.
+        _ = await control.ReadAsync(new byte[1]);
+        await shutdown.CancelAsync();
     }
 
     private static async Task<AttemptResult> ExecuteAsync(
-        RunnerRequest request, PluginRegistry plugins, ISharedData shared)
+        RunnerRequest request, PluginRegistry plugins, ISharedData shared, CancellationToken shutdown)
     {
         var job = request.Job;
-        using var timeout = new CancellationTokenSource(job.AttemptTimeout ?? Timeout.InfiniteTimeSpan);
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(shutdown);
+        if (job.AttemptTimeout is { } limit)
+            timeout.CancelAfter(limit);
         var ct = timeout.Token;
         try
         {
+            ct.ThrowIfCancellationRequested();
             var options = Protocol.Parse(job.OptionsJson);
             var key = $"{job.RunId:N}:{job.Id}";
             if (job.Kind == "Fetch" && job.Cursor is not null)
@@ -98,6 +124,10 @@ internal static partial class BusinessHost
         }
         catch (Exception exception)
         {
+            if (shutdown.IsCancellationRequested)
+                return AttemptResult.Abandoned;
+            if (ct.IsCancellationRequested)
+                return AttemptResult.TimedOut;
             return Classify(exception, allowInvalid: job.NodeKind != "Group" && job.Kind != "Finish");
         }
     }
@@ -122,6 +152,7 @@ internal static partial class BusinessHost
         }
         catch (Exception exception)
         {
+            ct.ThrowIfCancellationRequested();
             result = Classify(exception);
         }
 
@@ -133,6 +164,9 @@ internal static partial class BusinessHost
         }
         catch (Exception exception)
         {
+            ct.ThrowIfCancellationRequested();
+            if (result is { Status: "Failed", Retryable: false })
+                return result;
             return Classify(exception, allowInvalid: false);
         }
         return result;
@@ -164,7 +198,7 @@ internal static partial class BusinessHost
         if (allowInvalid && exception is BusinessInvalidException)
             return new("Invalid", Error: Protocol.Error(exception));
         return AttemptResult.Failure(Protocol.Error(exception),
-            exception is not (PermanentProcessException or InvalidDataException or JsonException));
+            exception is not (PermanentProcessException or InvalidDataException or JsonException or TimeoutException or SqlException { Number: -2 }));
     }
 
     private sealed class SharedProxy(TextReader input, TextWriter output) : ISharedData, IDisposable

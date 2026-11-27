@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.IO.Pipes;
 using System.Text.Json;
 using Microsoft.Data.SqlClient;
 
@@ -8,6 +9,9 @@ namespace BatchEngine;
 internal sealed class Runner(Store store, string workerId, int pageSize) : IAsyncDisposable
 {
     private Process? process;
+    private AnonymousPipeServerStream? shutdownPipe;
+
+    internal void RequestStop() => Interlocked.Exchange(ref shutdownPipe, null)?.Dispose();
 
     internal async Task<AttemptResult> RunAsync(JobLease job, CancellationToken ct)
     {
@@ -26,7 +30,10 @@ internal sealed class Runner(Store store, string workerId, int pageSize) : IAsyn
                 var message = JsonSerializer.Deserialize<RunnerMessage>(line, Protocol.Json)
                     ?? throw new InvalidDataException("Missing business runner message");
                 if (message is { Type: "result", Result: { } outcome })
+                {
+                    deadline.ThrowIfCancellationRequested();
                     return outcome;
+                }
                 if (message is not { Type: "shared", Shared: { } request })
                     throw new InvalidDataException("Unexpected business runner message");
 
@@ -41,17 +48,17 @@ internal sealed class Runner(Store store, string workerId, int pageSize) : IAsyn
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            await StopAsync();
+            await StopAsync(force: true);
             throw;
         }
         catch (OperationCanceledException) when (deadline.IsCancellationRequested)
         {
-            await StopAsync();
-            return AttemptResult.Failure("Attempt timed out");
+            await StopAsync(force: true);
+            return AttemptResult.TimedOut;
         }
         catch (Exception ex)
         {
-            await StopAsync();
+            await StopAsync(force: true);
             return AttemptResult.Failure(Protocol.Error(ex));
         }
     }
@@ -61,6 +68,7 @@ internal sealed class Runner(Store store, string workerId, int pageSize) : IAsyn
         if (process is { HasExited: false })
             return process;
 
+        RequestStop();
         process?.Dispose();
         process = null;
         var path = Environment.ProcessPath ?? throw new InvalidOperationException("Cannot locate the worker executable");
@@ -75,9 +83,14 @@ internal sealed class Runner(Store store, string workerId, int pageSize) : IAsyn
         start.ArgumentList.Add("business-host");
         start.ArgumentList.Add(Environment.ProcessId.ToString(CultureInfo.InvariantCulture));
 
+        shutdownPipe = new AnonymousPipeServerStream(PipeDirection.Out, HandleInheritability.Inheritable);
+        start.ArgumentList.Add(shutdownPipe.GetClientHandleAsString());
+
         // The runner uses the worker's fenced shared-data interface.
         start.Environment.Remove("BATCH_SQL_CONNECTION");
-        return process = Process.Start(start) ?? throw new IOException("Could not start a business runner");
+        process = Process.Start(start) ?? throw new IOException("Could not start a business runner");
+        shutdownPipe.DisposeLocalCopyOfClientHandle();
+        return process;
     }
 
     private static async Task SendAsync<T>(Process child, T value, CancellationToken ct)
@@ -87,8 +100,9 @@ internal sealed class Runner(Store store, string workerId, int pageSize) : IAsyn
         await child.StandardInput.FlushAsync(ct);
     }
 
-    private async ValueTask StopAsync()
+    private async ValueTask StopAsync(bool force)
     {
+        RequestStop();
         var child = process;
         process = null;
         if (child is null)
@@ -97,15 +111,20 @@ internal sealed class Runner(Store store, string workerId, int pageSize) : IAsyn
         {
             try
             {
+                if (!force && !child.HasExited)
+                {
+                    child.StandardInput.Close();
+                    using var grace = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                    try { await child.WaitForExitAsync(grace.Token); }
+                    catch (OperationCanceledException) when (grace.IsCancellationRequested) { }
+                }
                 if (!child.HasExited)
                     child.Kill(entireProcessTree: true);
-                using var wait = new CancellationTokenSource(TimeSpan.FromSeconds(2));
-                await child.WaitForExitAsync(wait.Token);
+                await child.WaitForExitAsync();
             }
             catch (InvalidOperationException) when (child.HasExited) { }
-            catch (OperationCanceledException) { }
         }
     }
 
-    public ValueTask DisposeAsync() => StopAsync();
+    public ValueTask DisposeAsync() => StopAsync(force: false);
 }

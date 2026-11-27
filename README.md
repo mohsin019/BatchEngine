@@ -23,7 +23,54 @@ dotnet src/BatchEngine/bin/Debug/net10.0/BatchEngine.dll init-db
 dotnet src/BatchEngine/bin/Debug/net10.0/BatchEngine.dll worker
 ~~~
 
-Use the demo credentials and certificate settings for local Compose runs. For a shared deployment, give the submitter permission to execute batch.Submit, the front end read access to status views or queries, and the worker permission to execute the dispatch procedures and read the queued submissions. Use an account with DDL permissions for init-db and a TLS-verified connection string for the workers.
+Use the demo credentials and certificate settings for local Compose runs. For a shared deployment, give the submitter permission to execute batch.Submit and batch.Resume, the front end read access to status views or queries, and the worker permission to execute the dispatch procedures and read the queued submissions. Use an account with DDL permissions for init-db and a TLS-verified connection string for the workers.
+
+## Worker service and recovery
+
+The `worker` command runs a .NET 10 hosted background service. An unexpected exception in the scheduling loop starts another worker loop after five seconds. The host creates a fresh business runner when a child exits. Configure a service manager on each machine so a crash of the host executable also restarts it. Docker Compose sets `restart: unless-stopped` on the worker service.
+
+**Linux with systemd.** Publish the worker to the target machine's `/opt/batch-engine` directory. Put `BATCH_SQL_CONNECTION` and any plugin settings in `/etc/batch-engine.env`. Install the supplied unit under `/etc/systemd/system/` and enable it. [Systemd unit](deploy/batch-engine.service)
+
+~~~sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now batch-engine
+~~~
+
+**Windows Service.** Publish for the machine's architecture and set the service account's connection string and plugin paths in its service environment. For an installation under `C:\BatchEngine`, run these commands from an elevated command prompt.
+
+~~~bat
+sc.exe create BatchEngine binPath= "C:\BatchEngine\BatchEngine.exe worker" start= auto
+sc.exe failure BatchEngine reset= 86400 actions= restart/5000/restart/5000/restart/5000
+sc.exe failureflag BatchEngine 1
+sc.exe start BatchEngine
+~~~
+
+On a service stop the worker stops claiming jobs and signals cancellation to active business handlers. They have `BATCH_GRACE_SECONDS` (default 15) to return or unwind. The worker saves completed results, terminates any remaining runners after the grace period and returns interrupted jobs to SQL. If the machine or database is unavailable, another worker recovers outstanding leases after expiry. An intentional service stop leaves work eligible on other nodes. Set the service manager's shutdown allowance above the configured grace period to allow time for SQL settlement.
+
+## Resume a stopped group
+
+A permanent exception in a process handler, exhausted transient retries, or a task or process timeout sets the submitted run and its active nodes to `Stopped`. The stop transaction fences active job leases across the group and preserves waiting descendants and sibling branches. Other submitted groups remain eligible under their configured concurrency policies. The status endpoint shows the cause in `Error`, the time in `StoppedAt` and the execution phase on each node.
+
+Re-execute the **original run ID** after addressing the cause. The API, CLI and SQL procedure all use the same resume operation.
+
+~~~text
+POST /api/runs/{runId}/resume?expectedResumeCount=0
+dotnet BatchEngine.dll resume <run-id>
+EXEC batch.Resume @RunId = @RunId, @ExpectedResumeCount = 0;
+~~~
+
+The optional count comes from the status response. Including it protects against a delayed or repeated request resuming a later stop and returns HTTP 409 if the count changed. A fresh submission key creates a separate run. Resuming preserves the original configuration, selection, tree, shared data and job IDs.
+
+| Stage at stop | Work performed on resume |
+| --- | --- |
+| Start or finish hook | Retry the unfinished hook. Previously completed stages stay complete. |
+| Fetch in progress | Continue from the last committed cursor. The unique process and volume key prevents duplicate engine task rows across overlapping pages. |
+| Fetch complete | Reuse the staged volume. Retry failed tasks with a fresh attempt allowance and dispatch pending tasks. Success and business Invalid results are retained. |
+| Process deadline expired | Re-enter normal cross-run admission with a fresh process time budget. The hierarchy continues after the process completes. |
+
+Task attempts keep their identity across a resume. Business tables and external services can still see a repeated write if the handler committed before its lease was lost. Use the task's `IdempotencyKey` or a unique business key for those writes.
+
+For an upgrade, stop the old workers, run `init-db` once, then deploy the new workers and API. Existing terminal runs retain their recorded outcomes. Grant the caller of the resume API or CLI execute permission on `batch.Resume`.
 
 ## Submit and inspect workflows
 
@@ -35,11 +82,11 @@ A workflow is a JSON tree with a group at its root. Groups can contain groups an
 | configuration | Key of a saved SQL Server process configuration. A referenced configuration supplies the settings for that process. |
 | handler | Registered, versioned business handler name on a process with inline settings. |
 | max_parallel_tasks | Simultaneous task leases for this process instance across all workers. The default is 1. |
-| max_attempts | Maximum attempts per task, lifecycle stage or fetch page. The default is 3. |
+| max_attempts | Maximum attempts per task, lifecycle stage or fetch page within a retry window. The default is 3. |
 | timeout_seconds | Deadline for each attempt, including hooks and shared-data calls. The default is 60. |
 | options | JSON object passed to the process and its tasks. |
 
-A process finishes its own work and its after-process hook before releasing children. Invalid advances the tree and rolls up to the ancestors. An exhausted technical failure skips that process's descendants and any later children on the same serial branch. Eligible parallel branches continue. Failed takes precedence over Invalid in the final subtree status. Node OwnStatus shows the process's own result. Node Status includes its descendants.
+A process finishes its own work and its after-process hook before releasing children. Invalid advances the tree and rolls up to the ancestors. An unrecoverable process error pauses the run at its current hierarchy position. Resuming the run releases later children after their prerequisites complete. Node OwnStatus shows the process's own result. Node Status includes its descendants.
 
 Submit an immutable snapshot using the CLI, a stored procedure, or an insert. A repeated non-null submission key returns the original run ID when you call batch.Submit.
 
@@ -103,7 +150,7 @@ Use key, type, configuration and optional children on a configured process node.
 | AllowSameProcessAcrossRuns | Set to zero to serialize instances of this configuration across separate submissions. |
 | AllowOtherProcessesAcrossRuns | Set to zero for exclusive process execution across runs. The process waits for existing work in other runs to finish. New processes in those runs wait until it completes its own work and finish hook. |
 
-Existing configurations default to parallel task mode, an enabled task timeout inherited from TimeoutSeconds, a disabled process deadline and both overlap policies enabled. A process deadline expires outstanding work and schedules the after-process hook with a Failed outcome. TaskStatus marks unfinished released tasks Failed and staged tasks Skipped. Run init-db and update all workers and the API before using these settings.
+Existing configurations default to parallel task mode, an enabled task timeout inherited from TimeoutSeconds, a disabled process deadline and both overlap policies enabled. A process deadline stops the run. Interrupted running tasks are recorded as failed and unstarted tasks remain pending.
 
 ## Group management API
 
@@ -124,6 +171,7 @@ Send Authorization with the Bearer scheme and the service key from your frontend
 | GET /api/process-configurations | List saved configuration keys for the process picker. |
 | PUT /api/groups/{key} | Save a group and its full hierarchy. |
 | POST /api/groups/{key}/runs | Queue the selected saved group revision. Returns HTTP 202, a run ID and a status URL. |
+| POST /api/runs/{id}/resume | Resume the saved run. Optionally supply expectedResumeCount from its status response. |
 | GET /api/runs/{id} | Read run status, process states and progress. Set taskLimit from 0 to 100 to include individual tasks. |
 
 The two lists accept limit from 1 to 100 and afterKey for paging by key. A group save takes displayName, expectedRevision and children. Use revision 0 to create a group. To edit or reorder a hierarchy, send the new children array with the currently saved revision. A child group can contain groups and processes. A process references a saved configuration and may have process children.
@@ -167,7 +215,7 @@ Implement IBatchGroup in a business plugin and give the class a GroupHandler att
 }
 ~~~
 
-BeforeGroupAsync runs before any child starts. AfterGroupAsync runs after the group’s children finish and receives their combined Success, Invalid, or Failed outcome. When the start hook fails permanently or exhausts retries, the engine skips the children and still calls the finish hook with Failed. A finish hook that exhausts its retries marks the group Failed.
+BeforeGroupAsync runs before any child starts. A paused group defers its finish hook until the resumed children finish. AfterGroupAsync runs after the group’s children finish and receives their combined Success, Invalid, or Failed outcome. When the start hook fails permanently or exhausts retries, the engine skips the children and still calls the finish hook with Failed. A finish hook that exhausts its retries marks the group Failed.
 
 Each hook is a leased job. Its attempt limit and deadline apply independently, and another node can recover an expired lease. Use GroupContext.IdempotencyKey for external effects that need deduplication across retries. Run init-db and deploy the updated workers before enabling group hooks.
 
@@ -213,7 +261,7 @@ Reference src/BatchEngine.Contracts from a .NET 10 class library. Create a publi
 | FetchRecordsAsync | Returns RecordPage values until NextCursor is null. The worker commits each page and its checkpoint together. Tasks are released after the final page. |
 | BeforeTaskAsync and RunTaskAsync | Run per task volume on any available worker. Return TaskResult.Success or TaskResult.Invalid with a reason. |
 | AfterTaskAsync | Receives the outcome of each attempt that returns or throws in the runner. An attempt killed by a crash or a hard timeout cannot call this hook. |
-| AfterProcessAsync | Receives the final outcome and counts for the process's own work, including a start or fetch failure. The engine can retry this hook independently. |
+| AfterProcessAsync | Receives the final outcome and counts for the process's own work, once the process reaches its finish stage. A stopped process defers this hook until execution resumes. A failure in the hook resumes at that same hook. |
 
 ### Query business tables and create task volumes
 
@@ -232,7 +280,7 @@ SQL Server commits the page’s task rows, progress counters, and next cursor to
 
 Size each volume within the 256 KiB payload limit and each fetch page within 4 MiB. One task outcome applies to its entire volume. When rows need independent retry or outcome tracking, return a separate task per row.
 
-Use stable record keys and stable keyset pagination over the source records. The engine keeps one task per process and record key, preserving the first accepted payload. A repeated cursor fails the fetch. A business rejection can also be signaled by BusinessInvalidException in start, fetch, or task work. Exceptions retry with exponential backoff up to the attempt limit. An after-task hook failure retries the task attempt. PermanentProcessException fails immediately.
+Use stable record keys and stable keyset pagination over the source records. The engine keeps one task per process and record key, preserving the first accepted payload. A repeated cursor fails the fetch. A business rejection can also be signaled by BusinessInvalidException in start, fetch, or task work. Transient exceptions retry with exponential backoff up to the attempt limit. An after-task hook failure retries the task attempt. PermanentProcessException and timeouts stop the process immediately.
 
 Handlers receive an IdempotencyKey that is stable across retries. Delivery is at least once. Use this key when writing external effects so a crash between the effect and its SQL settlement can be replayed safely. Store inter-stage state in context.Shared. GetManyAsync batches reads, and PutAsync supports version checks for concurrent updates. Writes commit independently, so make them replay-safe when they affect business logic. Business methods can land on different workers or subprocesses.
 

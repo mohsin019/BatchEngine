@@ -9,7 +9,7 @@ BEGIN
         DefinitionJson nvarchar(max) NOT NULL CHECK (ISJSON(DefinitionJson, OBJECT) = 1),
         InputJson nvarchar(max) NOT NULL DEFAULT N'{}' CHECK (ISJSON(InputJson, OBJECT) = 1),
         Status varchar(12) NOT NULL DEFAULT 'Queued'
-            CHECK (Status IN ('Queued', 'Running', 'Success', 'Invalid', 'Failed')),
+            CONSTRAINT CK_BatchSubmission_Status CHECK (Status IN ('Queued', 'Running', 'Success', 'Invalid', 'Failed', 'Stopped')),
         Error nvarchar(4000) NULL,
         SubmittedAt datetime2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
         StartedAt datetime2(3) NULL,
@@ -41,7 +41,7 @@ BEGIN
         Phase varchar(12) NOT NULL DEFAULT 'Waiting'
             CHECK (Phase IN ('Waiting', 'Start', 'Fetch', 'Task', 'Finish', 'Children', 'Done')),
         Status varchar(12) NOT NULL DEFAULT 'Pending'
-            CHECK (Status IN ('Pending', 'Running', 'Success', 'Invalid', 'Failed', 'Skipped')),
+            CONSTRAINT CK_BatchNode_Status CHECK (Status IN ('Pending', 'Running', 'Success', 'Invalid', 'Failed', 'Skipped', 'Stopped')),
         OwnStatus varchar(8) NULL,
         TasksReleased bit NOT NULL DEFAULT 0,
         TotalTasks bigint NOT NULL DEFAULT 0,
@@ -61,6 +61,35 @@ BEGIN
     CREATE INDEX IX_BatchNode_Dispatch ON batch.Node(RunId, Phase, Id)
         INCLUDE (RunningTasks, MaxParallelTasks) WHERE Phase IN ('Start', 'Fetch', 'Task', 'Finish');
 END;
+GO
+
+-- Earlier installations used system-named column checks. Replace only the engine's Status check.
+DECLARE @Table sysname, @Constraint sysname, @Sql nvarchar(max);
+DECLARE checks CURSOR LOCAL FAST_FORWARD FOR
+    SELECT t.name, c.name FROM sys.check_constraints c JOIN sys.tables t ON t.object_id = c.parent_object_id
+    JOIN sys.columns col ON col.object_id = t.object_id AND col.column_id = c.parent_column_id
+    WHERE t.schema_id = SCHEMA_ID('batch') AND t.name IN ('Node', 'Submission') AND col.name = 'Status'
+        AND c.is_system_named = 1 AND c.definition NOT LIKE '%Stopped%';
+OPEN checks;
+FETCH NEXT FROM checks INTO @Table, @Constraint;
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    SET @Sql = N'ALTER TABLE batch.' + QUOTENAME(@Table) + N' DROP CONSTRAINT ' + QUOTENAME(@Constraint);
+    EXEC(@Sql);
+    FETCH NEXT FROM checks INTO @Table, @Constraint;
+END;
+CLOSE checks;
+DEALLOCATE checks;
+IF OBJECT_ID('batch.CK_BatchSubmission_Status') IS NULL
+    ALTER TABLE batch.Submission ADD CONSTRAINT CK_BatchSubmission_Status CHECK
+        (Status IN ('Queued','Running','Success','Invalid','Failed','Stopped'));
+IF OBJECT_ID('batch.CK_BatchNode_Status') IS NULL
+    ALTER TABLE batch.Node ADD CONSTRAINT CK_BatchNode_Status CHECK
+        (Status IN ('Pending','Running','Success','Invalid','Failed','Skipped','Stopped'));
+IF COL_LENGTH('batch.Node', 'ErrorBeforeStop') IS NULL
+    ALTER TABLE batch.Node ADD ErrorBeforeStop nvarchar(4000) NULL;
+IF COL_LENGTH('batch.Submission', 'StoppedAt') IS NULL
+    ALTER TABLE batch.Submission ADD StoppedAt datetime2(3) NULL, ResumeCount int NOT NULL DEFAULT 0;
 GO
 
 IF COL_LENGTH('batch.Node', 'GroupHandler') IS NULL
@@ -172,6 +201,13 @@ BEGIN
 END;
 GO
 
+-- Attempts stays visible to the handler. Subtract AttemptBase to charge only business attempts in this retry window.
+IF COL_LENGTH('batch.Job', 'AttemptBase') IS NULL
+    ALTER TABLE batch.Job ADD AttemptBase int NOT NULL DEFAULT 0;
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID('batch.Job') AND name = 'IX_BatchJob_Failed')
+    CREATE INDEX IX_BatchJob_Failed ON batch.Job(NodeId, Id) WHERE Status = 'Failed';
+GO
+
 IF COL_LENGTH('batch.Job', 'RowCount') IS NULL
     ALTER TABLE batch.Job ADD [RowCount] int NOT NULL DEFAULT 1 CHECK ([RowCount] > 0);
 GO
@@ -191,15 +227,15 @@ GO
 
 CREATE OR ALTER VIEW batch.TaskStatus AS
 SELECT n.RunId, n.NodeKey AS ProcessKey, j.Id, j.RecordKey,
-    CASE WHEN n.TasksReleased = 1 AND n.TimedOutAt IS NOT NULL AND j.Status IN ('Ready', 'Running') THEN 'Failed'
+    CASE WHEN n.TasksReleased = 1 AND n.TimedOutAt IS NOT NULL AND n.Status <> 'Stopped' AND j.Status IN ('Ready', 'Running') THEN 'Failed'
          WHEN n.TasksReleased = 1 THEN j.Status
          WHEN n.OwnStatus IS NULL THEN 'Staged'
          ELSE 'Skipped' END AS Status,
     j.Attempts, j.WorkerId, j.OutputJson,
-    CASE WHEN n.TasksReleased = 1 AND n.TimedOutAt IS NOT NULL AND j.Status IN ('Ready', 'Running')
+    CASE WHEN n.TasksReleased = 1 AND n.TimedOutAt IS NOT NULL AND n.Status <> 'Stopped' AND j.Status IN ('Ready', 'Running')
         THEN N'Process execution timed out' ELSE j.Error END AS Error,
     j.StartedAt,
-    CASE WHEN n.TasksReleased = 1 AND n.TimedOutAt IS NOT NULL AND j.Status IN ('Ready', 'Running')
+    CASE WHEN n.TasksReleased = 1 AND n.TimedOutAt IS NOT NULL AND n.Status <> 'Stopped' AND j.Status IN ('Ready', 'Running')
         THEN n.TimedOutAt ELSE j.FinishedAt END AS FinishedAt,
     j.[RowCount]
 FROM batch.Node n JOIN batch.Job j ON j.NodeId = n.Id

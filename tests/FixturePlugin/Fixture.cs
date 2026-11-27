@@ -9,6 +9,8 @@ public sealed class Fixture : IBatchProcess
 {
     public async ValueTask BeforeProcessAsync(ProcessContext context, CancellationToken ct)
     {
+        if (Mode(context.Options) == "stop-start" && context.Attempt == 1)
+            throw new PermanentProcessException("Stop during process start");
         if (context.Options.TryGetProperty("requires", out var requirements))
         {
             var keys = requirements.EnumerateArray().Select(key => "end." + key.GetString()).ToArray();
@@ -35,6 +37,12 @@ public sealed class Fixture : IBatchProcess
         var to = Math.Min(count, from + limit);
         var records = Enumerable.Range(from, to - from).Select(i =>
             new Record(i.ToString(CultureInfo.InvariantCulture), JsonSerializer.SerializeToElement(i))).ToArray();
+        if (Mode(context.Options) == "stop-fetch" && from == 2)
+        {
+            if (context.Attempt == 1)
+                throw new PermanentProcessException("Fetch stopped after the first page");
+            return new([new Record("1", JsonSerializer.SerializeToElement(1)), records[0]], "3");
+        }
         if (Mode(context.Options) == "cursor-cycle")
             return new(records, "0");
         return new(records, to < count ? to.ToString(CultureInfo.InvariantCulture) : null);
@@ -53,6 +61,22 @@ public sealed class Fixture : IBatchProcess
         if (!beforeTaskRan)
             throw new PermanentProcessException("Before-task hook did not run");
         var mode = Mode(context.Options);
+        if (mode == "resume-task" && record.GetInt32() == 0)
+            return TaskResult.Invalid("Invalid before stop");
+        if (mode == "resume-task" && record.GetInt32() == 2 && context.Attempt == 1)
+            throw new PermanentProcessException("Stop this task once");
+        if (mode == "service-stop" && context.Attempt == 1)
+        {
+            await context.Shared.PutAsync("shutdown.entered", JsonSerializer.SerializeToElement(Environment.ProcessId),
+                cancellationToken: ct);
+            try { await Task.Delay(Timeout.InfiniteTimeSpan, ct); }
+            finally
+            {
+                await context.Shared.PutAsync("shutdown.finally", JsonSerializer.SerializeToElement(true));
+            }
+        }
+        if (mode == "exhaust-then-retry" && context.Attempt <= 3)
+            throw new IOException("Transient failure across two retry windows");
         if (mode == "permanent")
             throw new PermanentProcessException("Unrecoverable sample failure");
         if (mode == "timeout" && context.Attempt == 1)
@@ -88,6 +112,8 @@ public sealed class Fixture : IBatchProcess
 
     public async ValueTask AfterProcessAsync(ProcessContext context, ProcessOutcome outcome, CancellationToken ct)
     {
+        if (Mode(context.Options) == "stop-finish" && context.Attempt == 1)
+            throw new PermanentProcessException("Stop during process finish");
         var value = JsonSerializer.SerializeToElement(outcome.Status.ToString());
         await context.Shared.PutAsync("end." + context.ProcessKey, value, cancellationToken: ct);
     }

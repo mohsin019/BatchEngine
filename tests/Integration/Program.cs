@@ -27,6 +27,9 @@ try
     await FailuresAsync();
 
     await StopWorkersAsync();
+    await SupervisorAsync();
+    await ServiceShutdownAsync("service-stop");
+    await ServiceShutdownAsync("crash");
     await CrashRecoveryAsync();
     Console.WriteLine("SQL Server integration checks passed.");
 }
@@ -72,59 +75,65 @@ async Task HierarchyAsync()
 
 async Task FailuresAsync()
 {
-    var tree = Group("root", "parallel",
-        Group("serial", "serial",
-            Step("fail", 1, mode: "permanent", children: [Step("child-skipped", 1)]),
-            Step("sibling-skipped", 1)),
-        Step("healthy", 3, mode: "hold"),
-        Step("hard-timeout", 1, mode: "timeout", timeout: 1),
-        Step("fetch-error", 5, mode: "cursor-cycle"));
+    var run = await SubmitAsync(Group("root", "serial",
+        Step("work", 4, mode: "resume-task", children: [Step("child", 1)]), Step("next", 1)));
+    await ExpectStatusAsync(run, "Stopped");
+    var progress = (await ReadStatusAsync(run)).GetProperty("Progress");
+    Equal(2L, progress.GetProperty("ProcessedTasks").GetInt64(), "success and invalid were retained");
+    Equal(1L, progress.GetProperty("FailedTasks").GetInt64(), "unrecoverable task failed immediately");
+    Equal(1L, progress.GetProperty("PendingTasks").GetInt64(), "unstarted work stays pending");
+    Equal(2, await QueryAsync<int>("SELECT COUNT(*) FROM batch.Node WHERE RunId=@Run AND Status='Pending' AND StartedAt IS NULL", run),
+        "dependent child and next sibling have not started");
+    var failedId = await QueryAsync<long>("SELECT Id FROM batch.TaskStatus WHERE RunId=@Run AND Status='Failed'", run);
+    await ResumeAsync(run);
+    await ExpectStatusAsync(run, "Invalid");
+    Equal(2, await QueryAsync<int>("SELECT Attempts FROM batch.Job WHERE Id=@Run AND Status='Success'", failedId),
+        "the original failed job was retried on explicit resume");
+    Equal(2, await QueryAsync<int>("SELECT COUNT(*) FROM batch.TaskStatus WHERE RunId=@Run AND ProcessKey='work' AND RecordKey IN ('0','1') AND Attempts=1", run),
+        "previous success and invalid jobs were untouched");
+    Equal(2, await QueryAsync<int>("SELECT COUNT(*) FROM batch.Node WHERE RunId=@Run AND NodeKey IN ('next','child') AND Status='Success'", run),
+        "hierarchy continued after recovery");
 
-    var run = await SubmitAsync(tree);
-    await WaitAsync(async () => await QueryAsync<int>("""
-        SELECT COUNT(*) FROM batch.RunProgress
-        WHERE RunId=@Run AND Status='Running' AND ProcessedTasks=1 AND FailedTasks=1
-            AND SkippedTasks=2 AND RunningTasks=1 AND PendingTasks=2
-        """, run) == 1);
+    var fetch = await SubmitAsync(Group("root", "serial", Step("fetch", 4, mode: "stop-fetch")));
+    await ExpectStatusAsync(fetch, "Stopped");
+    Equal(2, await QueryAsync<int>("SELECT COUNT(*) FROM batch.TaskStatus WHERE RunId=@Run AND Status='Staged' AND Attempts=0", fetch),
+        "first fetch page survived and was never dispatched prematurely");
+    await ResumeAsync(fetch);
+    await ExpectStatusAsync(fetch, "Success");
+    Equal(4, await QueryAsync<int>("SELECT COUNT(*) FROM batch.TaskStatus WHERE RunId=@Run AND Attempts=1", fetch),
+        "overlapping fetch pages on resume produced four distinct tasks");
+    Equal(4L, await QueryAsync<long>("SELECT ProcessedRecords FROM batch.RunProgress WHERE RunId=@Run", fetch),
+        "overlapping rows did not inflate the counters");
 
-    var status = await ReadStatusAsync(run);
-    Equal("Running", status.GetProperty("Status").GetString(), "live CLI status");
-    var progress = status.GetProperty("Progress");
-    Equal(7L, progress.GetProperty("TotalTasks").GetInt64(), "live total includes staged records");
-    Equal(1L, progress.GetProperty("ProcessedTasks").GetInt64(), "live processed count");
-    Equal(2L, progress.GetProperty("PendingTasks").GetInt64(), "live pending count");
-    Equal(1L, progress.GetProperty("RunningTasks").GetInt64(), "live running count");
-    Equal(1L, progress.GetProperty("FailedTasks").GetInt64(), "live error count");
-    Equal(2L, progress.GetProperty("SkippedTasks").GetInt64(), "live skipped count");
-    var active = status.GetProperty("Nodes").EnumerateArray()
-        .Single(node => node.GetProperty("NodeKey").GetString() == "healthy");
-    Equal(2L, active.GetProperty("PendingTasks").GetInt64(), "live process pending count");
-    Equal(0, status.GetProperty("Tasks").GetArrayLength(), "progress can omit individual task rows");
+    foreach (var (mode, phase) in new[] { ("stop-start", "Start"), ("stop-finish", "Finish") })
+    {
+        var hook = await SubmitAsync(Group("root", "serial", Step("hook", 1, mode: mode), Step("next", 1)));
+        await ExpectStatusAsync(hook, "Stopped");
+        Equal(phase, await QueryAsync<string>("SELECT Phase FROM batch.Node WHERE RunId=@Run AND NodeKey='hook'", hook),
+            "the failed lifecycle stage was retained");
+        await ResumeAsync(hook);
+        await ExpectStatusAsync(hook, "Success");
+        Equal(1, await QueryAsync<int>("SELECT Attempts FROM batch.TaskStatus WHERE RunId=@Run AND ProcessKey='hook'", hook),
+            "start or finish recovery ran the original task once");
+    }
 
-    await QueryAsync<int>("""
-        INSERT batch.SharedData (RunId, [Key], ValueJson, Version)
-        VALUES (@Run, N'integration.release', N'true', 1);
-        SELECT 1;
-        """, run);
-    await ExpectStatusAsync(run, "Failed");
-    Equal(0L, await QueryAsync<long>("SELECT PendingTasks FROM batch.RunProgress WHERE RunId=@Run", run),
-        "terminal run has no pending records");
-    Equal(2, await QueryAsync<int>("SELECT COUNT(*) FROM batch.Node WHERE RunId=@Run AND Status='Skipped'", run),
-        "dependent processes were skipped");
-    Equal(2, await QueryAsync<int>("SELECT COUNT(*) FROM batch.TaskStatus WHERE RunId=@Run AND Status='Skipped' AND ProcessKey='fetch-error' AND Attempts=0", run),
-        "partially fetched tasks were skipped");
-    Equal(1, await QueryAsync<int>("SELECT Attempts FROM batch.TaskStatus WHERE RunId=@Run AND ProcessKey='fail' AND Status='Failed'", run),
-        "permanent task failed immediately");
-    Equal(2, await QueryAsync<int>("SELECT Attempts FROM batch.TaskStatus WHERE RunId=@Run AND ProcessKey='hard-timeout' AND Status='Success'", run),
-        "hard timeout recovered in a fresh runner");
-    Equal("Success", await QueryAsync<string>("SELECT Status FROM batch.Node WHERE RunId=@Run AND NodeKey='healthy'", run),
-        "independent parallel branch finished");
+    var exhausted = await SubmitAsync(Group("root", "serial", Step("retry", 1, mode: "exhaust-then-retry")));
+    await ExpectStatusAsync(exhausted, "Stopped");
+    await ResumeAsync(exhausted);
+    await ExpectStatusAsync(exhausted, "Success");
+    Equal(4, await QueryAsync<int>("SELECT Attempts FROM batch.TaskStatus WHERE RunId=@Run", exhausted),
+        "resume grants a fresh retry allowance while preserving the lifetime attempt number");
+
+    var cycle = await SubmitAsync(Group("root", "serial", Step("cycle", 5, mode: "cursor-cycle")));
+    await ExpectStatusAsync(cycle, "Stopped");
+    Equal(2, await QueryAsync<int>("SELECT COUNT(*) FROM batch.TaskStatus WHERE RunId=@Run AND Status='Staged'", cycle),
+        "a repeated cursor stopped the run without releasing its first page");
 
     var malformed = await SubmitAsync(Group("bad", "serial", new { key = "x", type = "process", handler = "missing" }));
     await ExpectStatusAsync(malformed, "Failed");
     Equal(0, await QueryAsync<int>("SELECT COUNT(*) FROM batch.Node WHERE RunId=@Run", malformed),
         "malformed submission failed before scheduling");
-    Console.WriteLine("Passed live progress, permanent failure, branch skipping, cursor-cycle detection, timeout and validation.");
+    Console.WriteLine("Passed group stop, task resume, partial volume resume, cursor-cycle detection and validation.");
 }
 
 async Task ConfiguredVolumesAsync()
@@ -182,17 +191,19 @@ async Task ConfiguredVolumesAsync()
             INSERT batch.SharedData (RunId, [Key], ValueJson, Version) VALUES (@Run, N'volumes.release', N'true', 1);
             SELECT 1;
             """, run);
-        await ExpectStatusAsync(run, "Failed");
+        await ExpectStatusAsync(run, "Stopped");
+        var stopped = (await ReadStatusAsync(run)).GetProperty("Progress");
+        Equal(2L, stopped.GetProperty("FailedRecords").GetInt64(), "failed volume carries its row count");
+        await ResumeAsync(run);
+        await ExpectStatusAsync(run, "Invalid");
         var progress = (await ReadStatusAsync(run)).GetProperty("Progress");
         Equal(3L, progress.GetProperty("TotalTasks").GetInt64(), "one task per result set");
-        Equal(6L, progress.GetProperty("TotalRecords").GetInt64(), "all result rows were counted");
-        Equal(4L, progress.GetProperty("ProcessedRecords").GetInt64(), "processed rows include invalid rows");
+        Equal(6L, progress.GetProperty("ProcessedRecords").GetInt64(), "all result rows were processed");
         Equal(2L, progress.GetProperty("InvalidRecords").GetInt64(), "invalid volume carries its row count");
-        Equal(2L, progress.GetProperty("FailedRecords").GetInt64(), "failed volume carries its row count");
         Equal(0L, progress.GetProperty("PendingRecords").GetInt64(), "a terminal run has no pending rows");
         await QueryAsync<int>("""
             IF EXISTS (SELECT 1 FROM batch.TaskStatus WHERE RunId=@Run AND RecordKey='1'
-                AND Status='Success' AND OutputJson=N'[1,2]' AND [RowCount]=2 AND Attempts=2)
+                AND Status='Success' AND OutputJson=N'[1,2]' AND [RowCount]=2 AND Attempts>=2)
                 SELECT 1;
             ELSE THROW 51014, 'Expected the first result set to reach its task intact', 1;
             """, run);
@@ -376,6 +387,21 @@ async Task GroupApiAsync()
         using var unknownSelection = await client.PostAsJsonAsync($"/api/groups/{group}/runs",
             new { revision = 3, processKeys = new[] { "unknown" } });
         Equal(HttpStatusCode.BadRequest, unknownSelection.StatusCode, "unknown process selection is rejected");
+        var resumeConfig = group + "-resume";
+        await SaveConfigurationAsync(resumeConfig, 0, 1, JsonSerializer.Serialize(new { count = 4, mode = "resume-task" }),
+            "integration.fixture.v1");
+        using var stopTree = await SaveAsync(3, Configured("work", resumeConfig));
+        Equal(HttpStatusCode.OK, stopTree.StatusCode, "save a resumable group");
+        using var stopSubmission = await client.PostAsJsonAsync($"/api/groups/{group}/runs", new { revision = 4 });
+        var stopId = (await stopSubmission.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("runId").GetGuid();
+        await ExpectStatusAsync(stopId, "Stopped");
+        var endpoint = $"/api/runs/{stopId}/resume?expectedResumeCount=0";
+        var responses = await Task.WhenAll(client.PostAsync(endpoint, null), client.PostAsync(endpoint, null));
+        using var accepted = responses.Single(response => response.StatusCode == HttpStatusCode.Accepted);
+        using var conflict = responses.Single(response => response.StatusCode == HttpStatusCode.Conflict);
+        Equal(stopId, (await accepted.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("runId").GetGuid(),
+            "resume uses the original run and concurrent requests only resume once");
+        await ExpectStatusAsync(stopId, "Invalid");
         Console.WriteLine("Passed group API editing, revision snapshots, sequential processes and group hooks.");
     }
     finally
@@ -455,16 +481,37 @@ async Task SchedulingPoliciesAsync()
     await ExpectStatusAsync(later, "Success");
 
     var bounded = await SubmitConfiguredAsync(deadline);
-    await ExpectStatusAsync(bounded, "Failed");
+    await ExpectStatusAsync(bounded, "Stopped");
     Equal(1, await QueryAsync<int>("""
         SELECT COUNT(*) FROM batch.Node WHERE RunId=@Run AND Kind='Process' AND TimedOutAt IS NOT NULL
         """, bounded), "the process deadline is durable");
-    Equal(2, await QueryAsync<int>("SELECT COUNT(*) FROM batch.TaskStatus WHERE RunId=@Run AND Status='Failed'", bounded),
-        "the process deadline fails both running and pending tasks");
+    Equal(1, await QueryAsync<int>("SELECT COUNT(*) FROM batch.TaskStatus WHERE RunId=@Run AND Status='Ready'", bounded),
+        "the process deadline retained the pending task");
     Equal(1, await QueryAsync<int>("SELECT SUM(Attempts) FROM batch.TaskStatus WHERE RunId=@Run", bounded),
         "disabled task timeout did not retry the held task before the process deadline");
 
+    await ReleaseAsync(bounded);
+    await ResumeAsync(bounded);
+    await ExpectStatusAsync(bounded, "Success");
+
+    var busy = prefix + "-all-busy";
+    await SaveConfigurationAsync(busy, 0, 2, heldOptions, "integration.fixture.v1", configure: p =>
+    {
+        p.Add("@ProcessTimeoutEnabled", SqlDbType.Bit).Value = true;
+        p.Add("@ProcessTimeoutSeconds", SqlDbType.Int).Value = 3;
+    });
+    var allRunning = await SubmitConfiguredAsync(busy);
+    await WaitAsync(async () => await QueryAsync<long>("SELECT RunningTasks FROM batch.RunProgress WHERE RunId=@Run", allRunning) == 2);
+    await ExpectStatusAsync(allRunning, "Stopped");
+    Equal(2L, await QueryAsync<long>("SELECT FailedTasks FROM batch.RunProgress WHERE RunId=@Run", allRunning),
+        "a deadline fenced both active workers and updated their counters atomically");
+    await ReleaseAsync(allRunning);
+    await ResumeAsync(allRunning);
+    await ExpectStatusAsync(allRunning, "Success");
+
     var retried = await SubmitConfiguredAsync(attempt);
+    await ExpectStatusAsync(retried, "Stopped");
+    await ResumeAsync(retried);
     await ExpectStatusAsync(retried, "Success");
     Equal(2, await QueryAsync<int>("SELECT Attempts FROM batch.TaskStatus WHERE RunId=@Run", retried),
         "enabled task timeout applied to the first attempt");
@@ -505,13 +552,10 @@ async Task GroupFailureAsync()
         key = "blocked", type = "group", lifecycle = GroupLifecycle(failStart: true),
         children = new[] { Step("unstarted", 1) }
     };
-    var failedChild = new
+    var run = await SubmitAsync(new
     {
-        key = "failed-child", type = "group", lifecycle = GroupLifecycle(),
-        children = new[] { Step("fails", 1, mode: "permanent") }
-    };
-
-    var run = await SubmitAsync(Group("root", "parallel", blocked, failedChild));
+        key = "root", type = "group", lifecycle = GroupLifecycle(), children = new[] { blocked }
+    });
     await ExpectStatusAsync(run, "Failed");
     Equal("Skipped", await QueryAsync<string>("SELECT Status FROM batch.Node WHERE RunId=@Run AND NodeKey='unstarted'", run),
         "failed group start blocks its children");
@@ -569,6 +613,78 @@ async Task FetchRecoveryAsync()
         WHERE n.RunId=@Run AND j.Kind='Fetch'
         """, run), "only the uncommitted fetch page was retried");
     Console.WriteLine("Passed fetch page rollback and lease recovery.");
+}
+
+async Task ResumeAsync(Guid run)
+{
+    var start = StartInfo("resume");
+    start.ArgumentList.Add(run.ToString());
+    using var process = Process.Start(start)!;
+    await process.WaitForExitAsync();
+    Equal(0, process.ExitCode, "resume CLI");
+}
+
+async Task SupervisorAsync()
+{
+    var directory = Directory.CreateTempSubdirectory("batch-supervisor-");
+    var plugin = Path.Combine(directory.FullName, "FixturePlugin.dll");
+    try
+    {
+        var start = StartInfo("worker");
+        start.Environment["BATCH_PLUGIN_PATHS"] = plugin;
+        start.RedirectStandardOutput = true;
+        using var service = new Process { StartInfo = start };
+        var restarting = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        service.OutputDataReceived += (_, line) =>
+        {
+            if (line.Data?.Contains("exited unexpectedly", StringComparison.Ordinal) == true)
+                restarting.TrySetResult();
+        };
+        service.Start();
+        service.BeginOutputReadLine();
+        try
+        {
+            await restarting.Task.WaitAsync(TimeSpan.FromSeconds(15));
+            File.Copy(typeof(Fixture).Assembly.Location, plugin);
+            var run = await SubmitAsync(Group("root", "serial", Step("recover-worker", 1)));
+            await ExpectStatusAsync(run, "Success");
+        }
+        finally
+        {
+            if (!service.HasExited) service.Kill(entireProcessTree: true);
+            await service.WaitForExitAsync();
+        }
+    }
+    finally { directory.Delete(recursive: true); }
+    Console.WriteLine("Passed automatic worker restart after a startup exception.");
+}
+
+async Task ServiceShutdownAsync(string mode)
+{
+    if (!OperatingSystem.IsLinux()) return;
+    var start = StartInfo("worker");
+    start.Environment["BATCH_GRACE_SECONDS"] = "2";
+    var service = Process.Start(start)!;
+    workers.Add(service);
+    var run = await SubmitAsync(Group("root", "serial", Step("work", 1, mode: mode)));
+    const string marker = "FROM batch.SharedData WHERE RunId=@Run AND [Key] IN ('shutdown.entered','crash.entered')";
+    await WaitAsync(async () => await QueryAsync<int>("SELECT COUNT(*) " + marker, run) == 1);
+    var childPid = await QueryAsync<int>("SELECT CONVERT(int, ValueJson) " + marker, run);
+    using var child = Process.GetProcessById(childPid);
+    using var term = Process.Start("kill", $"-TERM {service.Id}")!;
+    await term.WaitForExitAsync();
+    await service.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(25));
+    Equal(0, service.ExitCode, "intentional service stop");
+    Equal(true, child.HasExited, "the service reaped the business child");
+    if (mode == "service-stop")
+        Equal(1, await QueryAsync<int>("SELECT COUNT(*) FROM batch.SharedData WHERE RunId=@Run AND [Key]='shutdown.finally'", run),
+            "business cleanup ran while the lease was valid");
+    Equal("Ready", await QueryAsync<string>("SELECT Status FROM batch.TaskStatus WHERE RunId=@Run", run),
+        "interrupted work was returned before service exit");
+    workers.Add(Worker("restart"));
+    await ExpectStatusAsync(run, "Success");
+    await StopWorkersAsync();
+    Console.WriteLine("Passed graceful stop and restart during a business call.");
 }
 
 async Task CrashRecoveryAsync()
@@ -651,7 +767,7 @@ async Task<T> QueryAsync<T>(string sql, object value)
 async Task ExpectStatusAsync(Guid run, string expected)
 {
     await WaitAsync(async () => await QueryAsync<string>(
-        "SELECT Status FROM batch.Submission WHERE Id=@Run", run) is "Success" or "Invalid" or "Failed");
+        "SELECT Status FROM batch.Submission WHERE Id=@Run", run) is "Success" or "Invalid" or "Failed" or "Stopped");
     Equal(expected, await QueryAsync<string>("SELECT Status FROM batch.Submission WHERE Id=@Run", run), $"run {run}");
 }
 

@@ -43,7 +43,7 @@ app.Use(async (context, next) =>
     {
         await Results.Problem(detail: ex.Message, statusCode: StatusCodes.Status400BadRequest).ExecuteAsync(context);
     }
-    catch (SqlException ex) when (ex.Number is >= 51017 and <= 51020)
+    catch (SqlException ex) when (ex.Number is (>= 51017 and <= 51020) or 51022)
     {
         var status = ex.Number == 51018 ? StatusCodes.Status404NotFound : StatusCodes.Status409Conflict;
         await Results.Problem(detail: ex.Message, statusCode: status).ExecuteAsync(context);
@@ -112,6 +112,12 @@ api.MapPost("/groups/{key}/runs", async (string key, SubmitGroupRequest request,
         selection = JsonSerializer.Serialize(keys.Order(StringComparer.Ordinal), Protocol.Json);
     }
     var id = await store.SubmitGroupAsync(key, request.Revision.Value, inputJson, request.SubmissionKey, selection, ct);
+    return Results.Accepted($"/api/runs/{id}", new { runId = id });
+});
+
+api.MapPost("/runs/{id:guid}/resume", async (Guid id, int? expectedResumeCount, CancellationToken ct) =>
+{
+    await store.ResumeAsync(id, expectedResumeCount, ct);
     return Results.Accepted($"/api/runs/{id}", new { runId = id });
 });
 

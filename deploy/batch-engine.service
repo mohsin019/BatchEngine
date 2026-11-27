@@ -1,0 +1,18 @@
+[Unit]
+Description=Batch Engine Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+WorkingDirectory=/opt/batch-engine
+ExecStart=/usr/bin/dotnet /opt/batch-engine/BatchEngine.dll worker
+EnvironmentFile=/etc/batch-engine.env
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=160
+
+[Install]
+WantedBy=multi-user.target

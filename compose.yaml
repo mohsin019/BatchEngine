@@ -57,7 +57,9 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
-    stop_grace_period: 25s
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 45s
 
 volumes:
   sql-data:
